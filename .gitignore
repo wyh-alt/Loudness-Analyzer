@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# PyInstaller 构建产物
+build/
+dist/
+output/
+*.spec.bak
+# 保留仓库根的 spec 文件，忽略 PyInstaller 自动生成的 main.spec
+main.spec
+
+# 打包时自动拷贝进来的 ffmpeg / ffprobe（体积大，不进仓库）
+bin/
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
+
+# 生成的启动图
+assets/splash.png
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.iml
+
+# 系统
+Thumbs.db
+.DS_Store
