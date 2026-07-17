@@ -10,6 +10,7 @@ import sys
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,86 @@ LEGACY_LOUDNESS_SILENCE_DB = -60.0
 
 # Windows 下隐藏 ffmpeg/ffprobe 弹出的控制台窗口
 _CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+class ProcCancelled(Exception):
+    """被 CancelToken 中断时抛出，UI 层用来把中断跟正常错误区分开"""
+
+
+class CancelToken:
+    """把当前正在跑的 ffmpeg/ffprobe 进程绑到 token，cancel() 立即 kill，不再等它自然结束。
+    workers 每次进入 core 前把 token 传进去，取消时对 token 调 cancel() 就能立刻终止。"""
+
+    def __init__(self):
+        self._cancelled = False
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            p = self._proc
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    @property
+    def cancelled(self):
+        return self._cancelled
+
+    def check(self):
+        if self._cancelled:
+            raise ProcCancelled()
+
+    def _bind(self, proc):
+        """把新起的子进程注册到 token；如果已经 cancel 了就立刻 kill 并返回 False"""
+        with self._lock:
+            if self._cancelled:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False
+            self._proc = proc
+            return True
+
+    def _unbind(self):
+        with self._lock:
+            self._proc = None
+
+
+def _run(cmd, *, cancel_token=None, capture_output=True, stdin=None):
+    """subprocess.run 的可取消版本。若 cancel_token 已 cancel，起进程后立刻 kill 并抛 ProcCancelled。"""
+    stdout = subprocess.PIPE if capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(
+        cmd, stdout=stdout, stderr=stderr, stdin=stdin,
+        creationflags=_CREATIONFLAGS,
+    )
+    if cancel_token is not None:
+        if not cancel_token._bind(proc):
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            raise ProcCancelled()
+    try:
+        out, err = proc.communicate()
+    finally:
+        if cancel_token is not None:
+            cancel_token._unbind()
+    if cancel_token is not None and cancel_token.cancelled:
+        raise ProcCancelled()
+
+    class _R:
+        pass
+    r = _R()
+    r.returncode = proc.returncode
+    r.stdout = out
+    r.stderr = err
+    return r
 
 
 def find_tool(name):
@@ -77,15 +158,13 @@ def fmt_seconds(seconds):
     return f"{m}:{s:05.2f}"
 
 
-def probe_file(ffprobe, path):
+def probe_file(ffprobe, path, cancel_token=None):
     """用 ffprobe 读取容器/流层面的元数据"""
     cmd = [
         ffprobe, "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams", str(path),
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, creationflags=_CREATIONFLAGS
-    )
+    result = _run(cmd, cancel_token=cancel_token)
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe 失败: {result.stderr.decode(errors='ignore')[:300]}")
 
@@ -139,7 +218,7 @@ def probe_file(ffprobe, path):
     }
 
 
-def analyze_basic_stats(ffmpeg, path, channels):
+def analyze_basic_stats(ffmpeg, path, channels, cancel_token=None):
     """将音频解码为 float32 PCM，流式计算 Peak / RMS / DC Offset / 削波，避免整段读入内存"""
     if channels <= 0:
         channels = 1
@@ -153,6 +232,13 @@ def analyze_basic_stats(ffmpeg, path, channels):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         creationflags=_CREATIONFLAGS,
     )
+    # 注册到 cancel_token；已 cancel 就立刻 kill
+    if cancel_token is not None and not cancel_token._bind(proc):
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        raise ProcCancelled()
 
     count = 0
     sum_ch = np.zeros(channels, dtype=np.float64)
@@ -199,6 +285,10 @@ def analyze_basic_stats(ffmpeg, path, channels):
     proc.stdout.close()
     stderr_data = proc.stderr.read()
     proc.wait()
+    if cancel_token is not None:
+        cancel_token._unbind()
+        if cancel_token.cancelled:
+            raise ProcCancelled()
     if proc.returncode != 0 and count == 0:
         raise RuntimeError(f"ffmpeg 解码失败: {stderr_data.decode(errors='ignore')[:300]}")
 
@@ -231,16 +321,14 @@ def _parse_loudness_value(text):
     return float("-inf") if "inf" in text else float(text)
 
 
-def analyze_loudness(ffmpeg, path):
+def analyze_loudness(ffmpeg, path, cancel_token=None):
     """调用 ffmpeg ebur128 滤镜计算 LUFS-I / LUFS-S(max) / LUFS-M(max) / LRA / True Peak"""
     cmd = [
         ffmpeg, "-nostats", "-i", str(path),
         "-filter_complex", "ebur128=peak=true:framelog=info",
         "-f", "null", "-",
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, creationflags=_CREATIONFLAGS
-    )
+    result = _run(cmd, cancel_token=cancel_token)
     text = result.stderr.decode(errors="ignore")
 
     m_vals, s_vals = [], []
@@ -267,10 +355,10 @@ def analyze_loudness(ffmpeg, path):
     }
 
 
-def analyze_file(ffmpeg, ffprobe, path):
-    meta = probe_file(ffprobe, path)
-    basic = analyze_basic_stats(ffmpeg, path, meta["channels"])
-    loud = analyze_loudness(ffmpeg, path)
+def analyze_file(ffmpeg, ffprobe, path, cancel_token=None):
+    meta = probe_file(ffprobe, path, cancel_token=cancel_token)
+    basic = analyze_basic_stats(ffmpeg, path, meta["channels"], cancel_token=cancel_token)
+    loud = analyze_loudness(ffmpeg, path, cancel_token=cancel_token)
 
     rms = basic["rms_db"]
     rms_l = rms[0] if len(rms) >= 1 else None
@@ -446,7 +534,7 @@ def _pick_output_codec(ext, meta):
     return []
 
 
-def _measure_loudnorm(ffmpeg, path, target_i, target_tp, target_lra):
+def _measure_loudnorm(ffmpeg, path, target_i, target_tp, target_lra, cancel_token=None):
     """loudnorm 第一遍：只测量，输出 JSON 到 stderr"""
     cmd = [
         ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
@@ -454,9 +542,7 @@ def _measure_loudnorm(ffmpeg, path, target_i, target_tp, target_lra):
         f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json",
         "-f", "null", "-",
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, creationflags=_CREATIONFLAGS
-    )
+    result = _run(cmd, cancel_token=cancel_token)
     text = result.stderr.decode(errors="ignore")
     start = text.rfind("{")
     end = text.rfind("}")
@@ -516,14 +602,16 @@ def process_file(
     target_i=None, target_tp=None, tolerance_lu=None,
     measured_lufs=None, measured_tp=None,
     format_config=None,
+    cancel_token=None,
 ):
     """把 src_path 处理后另存到 dst_dir。source 保持不变。
     - normalize_loudness=True 时走 loudnorm 二次通过（LUFS 已在容差且 TP 合规就跳过 loudnorm）
     - format_config is not None 时按 dict 指定的格式/采样率/位深或码率/声道 重新封装编码
     - 两者都为假：直接 copy 到目标目录
+    - cancel_token：允许 UI 立即中断当前正在跑的 ffmpeg
     返回 (dst_path: Path, loudnorm_applied: bool, converted: bool)"""
     src = Path(src_path)
-    src_meta = probe_file(ffprobe, src)
+    src_meta = probe_file(ffprobe, src, cancel_token=cancel_token)
 
     # 决定输出扩展名与目标路径
     out_ext = (format_config or {}).get("ext") or src.suffix.lower()
@@ -567,11 +655,15 @@ def process_file(
         out_ch = src_meta.get("channels")
         codec_args = _pick_output_codec(out_ext, src_meta)
 
-    # loudnorm filter chain
+    # loudnorm filter chain：两遍法（测量 + 应用），linear=true 保留动态。
+    # 后面接 alimiter 做真峰保护：即便 loudnorm 因源 LRA > LOUDNORM_TARGET_LRA
+    # 静默回退到 dynamic，或者 linear 结果的 inter-sample 峰值略超上限，
+    # alimiter 也能兜底把峰压回目标 TP，不再放大动态压缩的量。
     af = None
     if need_loudnorm:
         stats = _measure_loudnorm(
-            ffmpeg, src, target_i, target_tp, LOUDNORM_TARGET_LRA
+            ffmpeg, src, target_i, target_tp, LOUDNORM_TARGET_LRA,
+            cancel_token=cancel_token,
         )
         try:
             input_i = float(stats.get("input_i", "-inf"))
@@ -581,6 +673,8 @@ def process_file(
         if input_i <= -70.0 or input_i == float("-inf"):
             need_loudnorm = False
         else:
+            # alimiter 只做峰值兜底：level=disabled/asc=off，避免自动电平把响度顶上去
+            tp_linear = 10 ** (target_tp / 20.0)
             af = (
                 f"loudnorm=I={target_i}:TP={target_tp}:LRA={LOUDNORM_TARGET_LRA}"
                 f":measured_I={stats.get('input_i', 0)}"
@@ -589,7 +683,8 @@ def process_file(
                 f":measured_thresh={stats.get('input_thresh', -70)}"
                 f":offset={stats.get('target_offset', 0)}"
                 f":linear=true"
-                f":print_format=summary"
+                f":print_format=summary,"
+                f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0"
             )
 
     # 只需要 loudnorm 被跳过 + 也没有格式转换 = 直接 copy
@@ -607,7 +702,16 @@ def process_file(
     cmd += codec_args
     cmd += [str(dst)]
 
-    result = subprocess.run(cmd, capture_output=True, creationflags=_CREATIONFLAGS)
+    try:
+        result = _run(cmd, cancel_token=cancel_token)
+    except ProcCancelled:
+        # 中断留下的半成品文件要清掉，避免下一轮误当已处理
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        raise
     if result.returncode != 0 or not dst.exists():
         if dst.exists():
             try:

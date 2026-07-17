@@ -26,7 +26,8 @@ from PyQt6.QtWidgets import (
 
 from core import (
     analyze_file, scan_folder, write_excel, find_tool, build_table_row,
-    process_file, FORMAT_LOSSLESS, FORMAT_LOSSY, TABLE_HEADERS,
+    process_file, CancelToken, ProcCancelled,
+    FORMAT_LOSSLESS, FORMAT_LOSSY, TABLE_HEADERS,
 )
 
 # PyInstaller onefile 会把资源解压到 sys._MEIPASS；开发模式下按脚本目录取即可
@@ -311,6 +312,44 @@ QDoubleSpinBox#normSpin::up-arrow:pressed {{
 QDoubleSpinBox#normSpin::down-arrow:pressed {{
     image: url({_arrow_svg('#ffffff', up=False)});
 }}
+QComboBox#normCombo {{
+    background: {c['surface']};
+    color: {c['text']};
+    border: 1px solid {c['border']};
+    border-radius: 4px;
+    padding-left: 6px;
+    padding-right: 4px;
+    font-size: 12px;
+}}
+QComboBox#normCombo:focus, QComboBox#normCombo:on {{
+    border-color: {c['accent']};
+}}
+QComboBox#normCombo:disabled {{
+    color: {c['text_hint']};
+}}
+QComboBox#normCombo::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 16px;
+    border: none;
+    background: transparent;
+}}
+QComboBox#normCombo::down-arrow {{
+    image: url({_arrow_svg(c['text'], up=False)});
+    width: 10px;
+    height: 8px;
+}}
+QComboBox#normCombo::down-arrow:disabled {{
+    image: url({_arrow_svg(c['text_hint'], up=False)});
+}}
+QComboBox#normCombo QAbstractItemView {{
+    background: {c['surface']};
+    color: {c['text']};
+    border: 1px solid {c['border']};
+    selection-background-color: {c['accent']};
+    selection-color: #ffffff;
+    outline: 0;
+}}
 """
 
 
@@ -361,16 +400,28 @@ class DropLineEdit(QLineEdit):
 
 
 class SelectionBorderDelegate(QStyledItemDelegate):
-    """Excel 风格：选中的单元格四周画一条稍粗的强调色边框，其它单元格照常绘制。"""
+    """Excel 风格：选中的单元格四周画一条稍粗的强调色边框。
+    另外支持"当前处理行"整行高亮 —— 在 super().paint() 之前先铺一层半透明底色，
+    这样样式表里 ::item 的 alpha 覆盖问题不会影响这里的绘制。"""
 
     def __init__(self, color, parent=None):
         super().__init__(parent)
         self._color = QColor(color)
+        self._current_row = -1
 
     def set_color(self, color):
         self._color = QColor(color)
 
+    def set_current_row(self, row):
+        self._current_row = row
+
     def paint(self, painter, option, index):
+        if self._current_row == index.row() and self._current_row >= 0:
+            painter.save()
+            bg = QColor(self._color)
+            bg.setAlpha(110)
+            painter.fillRect(option.rect, bg)
+            painter.restore()
         super().paint(painter, option, index)
         if option.state & QStyle.StateFlag.State_Selected:
             painter.save()
@@ -384,12 +435,39 @@ class SelectionBorderDelegate(QStyledItemDelegate):
 
 class ResultsTable(QTableWidget):
     """窗口宽度变化时所有列按同一比例缩放；用户手动调整某一列时，最右侧列自动吸收/让出空间；
-    首次显示时若默认列宽合计超过可视宽度，则整体压缩到 viewport 内，避免右侧列被裁掉。"""
+    首次显示时若默认列宽合计超过可视宽度，则整体压缩到 viewport 内，避免右侧列被裁掉。
+    也接受文件/文件夹拖入，转发给外部同一套加载流程。"""
+
+    files_dropped = pyqtSignal(list)  # 拖入的本地路径列表
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._suppress_fit = False
         self._did_initial_fit = False
+        self.setAcceptDrops(True)
+        # 关掉表格内部的 InternalMove 拖拽，避免与外部文件拖入冲突
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        urls = e.mimeData().urls() if e.mimeData().hasUrls() else []
+        paths = [u.toLocalFile() for u in urls if u.toLocalFile()]
+        if paths:
+            e.acceptProposedAction()
+            self.files_dropped.emit(paths)
+        else:
+            super().dropEvent(e)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -467,7 +545,8 @@ class ResultsTable(QTableWidget):
 
 
 class AnalyzeWorker(QThread):
-    """给已列出的 rows 逐首跑 analyze_file，把响度指标回填到 row["data"]"""
+    """给已列出的 rows 逐首跑 analyze_file，把响度指标回填到 row["data"]。
+    取消时会立刻 kill 正在跑的 ffmpeg（通过 CancelToken），不等文件跑完。"""
     progress = pyqtSignal(int, int, str)
     row_updated = pyqtSignal(int, dict)
     finished_ok = pyqtSignal(int, int)  # total, error_count
@@ -479,23 +558,26 @@ class AnalyzeWorker(QThread):
         self.rows = rows
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
-        self._cancel = False
+        self._token = CancelToken()
 
     def cancel(self):
-        self._cancel = True
+        self._token.cancel()
 
     def run(self):
         total = len(self.rows)
         errors = 0
         for idx, row in enumerate(self.rows):
-            if self._cancel:
+            if self._token.cancelled:
                 self.cancelled.emit()
                 return
             path = Path(row["dir"]) / row["name"]
             self.progress.emit(idx + 1, total, str(path))
             try:
-                data = analyze_file(self.ffmpeg, self.ffprobe, path)
+                data = analyze_file(self.ffmpeg, self.ffprobe, path, cancel_token=self._token)
                 new_row = {"name": path.name, "dir": str(path.parent), "data": data}
+            except ProcCancelled:
+                self.cancelled.emit()
+                return
             except Exception as e:
                 errors += 1
                 new_row = {"name": path.name, "dir": str(path.parent), "error": str(e)}
@@ -508,7 +590,8 @@ class ProcessWorker(QThread):
     源文件不会被改动，处理产物写到 out_dir，处理后重扫产物拿到新指标回填表格。"""
     progress = pyqtSignal(int, int, str)
     row_updated = pyqtSignal(int, dict)
-    finished_ok = pyqtSignal(str, int, int, int)  # out_dir, total, processed, errors
+    # out_dir, total, processed, skipped, errors
+    finished_ok = pyqtSignal(str, int, int, int, int)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
@@ -527,27 +610,24 @@ class ProcessWorker(QThread):
         self.target_tp = target_tp
         self.tolerance_lu = tolerance_lu
         self.format_config = format_config
-        self._cancel = False
+        self._token = CancelToken()
 
     def cancel(self):
-        self._cancel = True
+        self._token.cancel()
 
     def run(self):
         total = len(self.rows)
         processed = 0
+        skipped = 0  # 符合要求、直接原字节复制到输出目录的
         errors = 0
 
         for idx, row in enumerate(self.rows):
-            if self._cancel:
+            if self._token.cancelled:
                 self.cancelled.emit()
                 return
 
             src_path = Path(row["dir"]) / row["name"]
             self.progress.emit(idx + 1, total, str(src_path))
-
-            if row.get("error"):
-                # 之前分析就失败的：不能拿到 measured；仍然试一次处理，让 loudnorm 自己测
-                pass
 
             data = row.get("data") or {}
             measured_lufs = data.get("lufs_i")
@@ -563,23 +643,30 @@ class ProcessWorker(QThread):
                     measured_lufs=measured_lufs,
                     measured_tp=measured_tp,
                     format_config=self.format_config,
+                    cancel_token=self._token,
                 )
                 if loudnorm_applied or converted:
                     processed += 1
+                else:
+                    # loudnorm 被容差跳过 + 无格式转换 = 直接 copy，视为"符合要求无需处理"
+                    skipped += 1
                 # 处理后的文件重新走一遍分析，把新指标回填表格
-                new_data = analyze_file(self.ffmpeg, self.ffprobe, dst)
+                new_data = analyze_file(self.ffmpeg, self.ffprobe, dst, cancel_token=self._token)
                 new_row = {
                     "name": dst.name,
                     "dir": str(dst.parent),
                     "data": new_data,
                 }
+            except ProcCancelled:
+                self.cancelled.emit()
+                return
             except Exception as e:
                 errors += 1
                 new_row = {"name": src_path.name, "dir": str(src_path.parent), "error": str(e)}
 
             self.row_updated.emit(idx, new_row)
 
-        self.finished_ok.emit(str(self.out_dir), total, processed, errors)
+        self.finished_ok.emit(str(self.out_dir), total, processed, skipped, errors)
 
 
 class MainWindow(QWidget):
@@ -599,9 +686,11 @@ class MainWindow(QWidget):
 
         # 表格数据：每行是 {name, dir} / {name, dir, data} / {name, dir, error}
         self._loaded_rows = []
+        self._highlighted_row = -1  # 处理中高亮的行索引
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        # 底部边距缩小，让按钮行更贴近窗口下沿
+        layout.setContentsMargins(20, 20, 20, 10)
         layout.setSpacing(10)
 
         path_row = QHBoxLayout()
@@ -647,9 +736,9 @@ class MainWindow(QWidget):
         selectall_sc = QShortcut(QKeySequence.StandardKey.SelectAll, self, activated=self.on_select_all_shortcut)
         selectall_sc.setContext(Qt.ShortcutContext.WindowShortcut)
 
+        # 进度条挪到"格式标准化"下方（下一段的末尾 addWidget）
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setTextVisible(False)
-        layout.addWidget(self.progress_bar)
 
         SPIN_W = 100  # 数值+单位（"-12.0 LUFS"/"-1.0 dBTP"）+ 右侧上下按钮全部完整可见
         COMBO_W = 100
@@ -780,31 +869,31 @@ class MainWindow(QWidget):
         fmt_row.addStretch(1)
         layout.addLayout(fmt_row)
 
-        # 状态行 + 主按钮
-        status_row = QHBoxLayout()
+        # 进度条：格式标准化下方，按钮行上方
+        layout.addWidget(self.progress_bar)
+
+        # 状态文本与主按钮同一行，压缩纵向空间
+        btn_row = QHBoxLayout()
         self.status_label = QLabel("就绪", self)
         self.status_label.setObjectName("statusLabel")
-        status_row.addWidget(self.status_label)
-        status_row.addStretch(1)
-        layout.addLayout(status_row)
-
-        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.status_label)
         btn_row.addStretch(1)
+        # 导出与取消：次级按钮（灰底），响度统计与开始处理：主强调按钮（蓝底）
         self.export_btn = QPushButton("导出表格", self)
-        self.export_btn.setObjectName("browseBtn")
-        self.export_btn.setEnabled(False)  # 表格空时禁用；有数据后自动启用
-        self.measure_btn = QPushButton("响度统计", self)
-        self.measure_btn.setObjectName("browseBtn")
-        self.measure_btn.setEnabled(False)
+        self.export_btn.setObjectName("cancelBtn")
+        self.export_btn.setEnabled(False)  # 只有检测/处理完成后才允许导出
         self.cancel_btn = QPushButton("取消", self)
         self.cancel_btn.setObjectName("cancelBtn")
         self.cancel_btn.setEnabled(False)
+        self.measure_btn = QPushButton("响度统计", self)
+        self.measure_btn.setObjectName("startBtn")
+        self.measure_btn.setEnabled(False)
         self.start_btn = QPushButton("开始处理", self)
         self.start_btn.setObjectName("startBtn")
         self.start_btn.setEnabled(False)
         btn_row.addWidget(self.export_btn)
-        btn_row.addWidget(self.measure_btn)
         btn_row.addWidget(self.cancel_btn)
+        btn_row.addWidget(self.measure_btn)
         btn_row.addWidget(self.start_btn)
         layout.addLayout(btn_row)
 
@@ -814,6 +903,7 @@ class MainWindow(QWidget):
         self.export_btn.clicked.connect(self.on_export)
         self.measure_btn.clicked.connect(self.on_measure)
         self.path_edit.dropped.connect(self.on_path_dropped)
+        self.table.files_dropped.connect(self.on_table_dropped)
         self.normalize_cb.toggled.connect(self.on_normalize_toggled)
         self.format_cb.toggled.connect(self.on_format_toggled)
         self.format_combo.currentIndexChanged.connect(self._sync_format_specific_visibility)
@@ -831,6 +921,13 @@ class MainWindow(QWidget):
         if folder:
             self.path_edit.set_paths([folder])
             self.on_path_dropped()
+
+    def on_table_dropped(self, paths):
+        """表格区域拖入 —— 走跟拖到路径框一样的加载流程"""
+        if self.worker and self.worker.isRunning():
+            return
+        self.path_edit.set_paths(paths)
+        self.on_path_dropped()
 
     # ---------------- 参数区交互 ----------------
 
@@ -899,7 +996,8 @@ class MainWindow(QWidget):
         self.status_label.setText(
             f"已列出 {len(files)} 个文件；点「响度统计」检测响度，或直接「开始处理」（处理时自动检测）"
         )
-        self.export_btn.setEnabled(True)
+        # 拖入阶段还没做检测，不允许导出（表格只有文件名）
+        self.export_btn.setEnabled(False)
         self.measure_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
         self.start_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
 
@@ -990,6 +1088,23 @@ class MainWindow(QWidget):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(idx)
         self.status_label.setText(f"正在处理 ({idx}/{total})：{name}")
+        # 高亮当前行 + 滚动到可视区，便于用户直观追踪进度
+        self._highlight_row(idx - 1)
+
+    def _highlight_row(self, row_idx):
+        """通过 delegate 直接绘制整行高亮 + 滚动到该行。row_idx=-1 清除高亮。
+        走 delegate.paint() 是因为 QSS 里 ::item 会吞掉 setBackground 的 alpha。"""
+        if row_idx is None or row_idx < 0 or row_idx >= self.table.rowCount():
+            self._selection_delegate.set_current_row(-1)
+            self._highlighted_row = -1
+            self.table.viewport().update()
+            return
+        self._selection_delegate.set_current_row(row_idx)
+        self._highlighted_row = row_idx
+        self.table.viewport().update()
+        anchor = self.table.item(row_idx, 0)
+        if anchor is not None:
+            self.table.scrollToItem(anchor, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def on_copy_shortcut(self):
         """焦点在路径输入框时复制路径文本；否则复制表格里已选中的单元格。
@@ -1031,10 +1146,14 @@ class MainWindow(QWidget):
     def _reset_buttons(self):
         has_rows = bool(self._loaded_rows)
         deps_ok = bool(self.ffmpeg and self.ffprobe)
+        # 只要有可导出的响度数据就启用导出（检测完 or 处理完的行）
+        has_data = any(r.get("data") or r.get("error") for r in self._loaded_rows)
         self.start_btn.setEnabled(has_rows and deps_ok)
         self.measure_btn.setEnabled(has_rows and deps_ok)
         self.cancel_btn.setEnabled(False)
-        self.export_btn.setEnabled(has_rows)
+        self.export_btn.setEnabled(has_data)
+        # 一轮结束，清除进度高亮
+        self._highlight_row(-1)
 
     def on_measure_finished(self, total, error_count):
         self._reset_buttons()
@@ -1042,14 +1161,17 @@ class MainWindow(QWidget):
             f"响度检测完成：共 {total} 个文件，{error_count} 个失败"
         )
 
-    def on_process_finished(self, out_dir, total, processed, error_count):
+    def on_process_finished(self, out_dir, total, processed, skipped, error_count):
         self._reset_buttons()
         self.status_label.setText(
-            f"处理完成：共 {total} 个文件，实际处理 {processed}，失败 {error_count}"
+            f"处理完成：共 {total}，实际处理 {processed}，符合要求无需处理 {skipped}，失败 {error_count}"
         )
         reply = QMessageBox.question(
             self, "处理完成",
-            f"共 {total} 个文件，实际处理 {processed}，{error_count} 个失败。\n"
+            f"共 {total} 个文件\n"
+            f"  · 实际处理：{processed}\n"
+            f"  · 符合要求无需处理：{skipped}\n"
+            f"  · 失败：{error_count}\n\n"
             f"处理后的音频已保存到：\n{out_dir}\n\n是否打开该目录？",
         )
         if reply == QMessageBox.StandardButton.Yes:
