@@ -13,7 +13,7 @@ BORDER = (67, 69, 75, 255)     # #43454b
 TITLE_COLOR = (230, 232, 236, 255)  # #e6e8ec
 SUB_COLOR = (160, 164, 172, 255)    # #a0a4ac
 
-TITLE = "批量音频响度统计工具"
+TITLE = "音频响度标准化工具"
 SUBTITLE = "正在启动…"
 
 

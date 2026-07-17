@@ -9,6 +9,7 @@ import re
 import sys
 import json
 import shutil
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -57,12 +58,13 @@ def db(value):
     return 20.0 * np.log10(value)
 
 
-def fmt_db(value, digits=1, unit=""):
+def fmt_db(value, digits=2, unit=""):
+    """默认两位小数并强制补零（-12 -> -12.00），避免同列数值宽度不一致"""
     if value is None:
         return "N/A"
     if value == float("-inf"):
         return f"-inf {unit}" if unit else "-inf"
-    text = str(round(float(value), digits))
+    text = f"{float(value):.{digits}f}"
     return f"{text} {unit}" if unit else text
 
 
@@ -101,13 +103,13 @@ def probe_file(ffprobe, path):
     sample_rate = int(audio_stream.get("sample_rate", 0) or 0)
     channels = int(audio_stream.get("channels", 0) or 0)
     codec_name = audio_stream.get("codec_name", "")
+    sample_fmt = audio_stream.get("sample_fmt", "") or ""
 
     bit_depth = audio_stream.get("bits_per_raw_sample") or audio_stream.get("bits_per_sample")
     if codec_name in LOSSY_CODECS:
         # 有损编码没有真实位深，ffprobe 报出的 sample_fmt 只是解码缓冲区格式，非原始位深
         bit_depth = None
     elif not bit_depth or int(bit_depth) == 0:
-        sample_fmt = audio_stream.get("sample_fmt", "")
         fallback = {
             "u8": 8, "u8p": 8,
             "s16": 16, "s16p": 16,
@@ -120,12 +122,21 @@ def probe_file(ffprobe, path):
     duration = audio_stream.get("duration") or info.get("format", {}).get("duration")
     duration = float(duration) if duration else None
 
+    # 码率优先取音频流上的 bit_rate；有些容器（如 MP3 CBR）只在 format 里给
+    stream_br = audio_stream.get("bit_rate") or info.get("format", {}).get("bit_rate")
+    try:
+        bit_rate = int(stream_br) if stream_br else None
+    except (TypeError, ValueError):
+        bit_rate = None
+
     return {
         "sample_rate": sample_rate,
         "channels": channels,
         "bit_depth": int(bit_depth) if bit_depth else None,
         "duration": duration,
         "codec_name": codec_name,
+        "sample_fmt": sample_fmt,
+        "bit_rate": bit_rate,
     }
 
 
@@ -239,8 +250,10 @@ def analyze_loudness(ffmpeg, path):
         s_vals.append(_parse_loudness_value(s))
 
     def extract(label, pattern):
-        m = re.search(label + r".*?" + pattern, text, re.DOTALL)
-        return float(m.group(1)) if m else None
+        # ffmpeg 7.x 的 ebur128 会在开始处理前先打印一次全 0 / -70 / -inf 的初始 Summary，
+        # 处理完再打印一次真实值，所以必须取最后一次匹配，否则永远读到假数据
+        matches = list(re.finditer(label + r".*?" + pattern, text, re.DOTALL))
+        return float(matches[-1].group(1)) if matches else None
 
     lufs_i = extract(r"Integrated loudness:", r"I:\s*(-?\d+\.?\d*)")
     lra = extract(r"Loudness range:", r"LRA:\s*(-?\d+\.?\d*)")
@@ -298,11 +311,12 @@ def scan_folder(root_folders):
     return sorted(set(files))
 
 
-# Excel 导出：完整明细列（还原早期版本的全部字段），表头全部译为中文
+# Excel 导出：完整明细列，单位换行到第二行显示，避免窄列被截断
 HEADERS = [
-    "序号", "文件名", "采样率(Hz)", "位深", "声道数", "时长",
-    "峰值(dBFS)", "左声道RMS(dBFS)", "右声道RMS(dBFS)",
-    "平均响度(LUFS)", "短期最大响度(LUFS)", "瞬时最大响度(LUFS)", "响度范围(LU)", "真实峰值(dBFS)",
+    "序号", "文件名", "采样率\n(Hz)", "位深", "声道数", "时长",
+    "峰值\n(dBFS)", "左声道RMS\n(dBFS)", "右声道RMS\n(dBFS)",
+    "平均响度\n(LUFS)", "短期最大响度\n(LUFS)", "瞬时最大响度\n(LUFS)",
+    "响度范围\n(LU)", "真实峰值\n(dBTP)",
     "直流偏移", "是否削波", "备注",
 ]
 
@@ -361,6 +375,180 @@ def build_table_row(row):
     ]
 
 
+# ---------------- 响度标准化（loudnorm 二次通过） ----------------
+
+# loudnorm 内部工作在 192kHz 且线性模式对源 LRA 有上限；用 20 是 ffmpeg 允许的最大值，
+# 让绝大多数音乐能走线性缩放而不是被压缩动态
+LOUDNORM_TARGET_LRA = 20.0
+
+
+def _clamp_bitrate(bit_rate, lo, hi, default):
+    """把源码率截断到编码器可接受的范围；缺失时用 default"""
+    if not bit_rate:
+        return default
+    return max(lo, min(hi, int(bit_rate)))
+
+
+def _pick_output_codec(ext, meta):
+    """按扩展名选择编码器，尽量与源文件参数保持一致。
+    - PCM/WAV：按源位深选 pcm_s16le / pcm_s24le / pcm_s32le
+    - FLAC：按源位深指定 sample_fmt（避免 24bit 源被降到 16bit）
+    - 有损（MP3/AAC/OGG/OPUS/WMA）：`-b:a` 用源码率，缺失时回落到默认值"""
+    ext = ext.lower()
+    bit_depth = meta.get("bit_depth")
+    codec_name = (meta.get("codec_name") or "").lower()
+    bit_rate = meta.get("bit_rate")
+
+    if ext == ".wav" or codec_name.startswith("pcm"):
+        if bit_depth == 24:
+            return ["-c:a", "pcm_s24le"]
+        if bit_depth == 32:
+            # 源为 32-bit float 时用 pcm_f32le 更贴近原始表示
+            if (meta.get("sample_fmt") or "").startswith(("flt", "dbl")):
+                return ["-c:a", "pcm_f32le"]
+            return ["-c:a", "pcm_s32le"]
+        if bit_depth == 8:
+            return ["-c:a", "pcm_u8"]
+        return ["-c:a", "pcm_s16le"]
+    if ext == ".flac":
+        # FLAC 只支持整数样本；把 24/32bit 源保为 s32 让编码器按最大精度存
+        sample_fmt = "s16"
+        if bit_depth and bit_depth >= 24:
+            sample_fmt = "s32"
+        return ["-c:a", "flac", "-sample_fmt", sample_fmt]
+    if ext == ".mp3":
+        br = _clamp_bitrate(bit_rate, 32_000, 320_000, 192_000)
+        return ["-c:a", "libmp3lame", "-b:a", str(br)]
+    if ext in (".m4a", ".aac"):
+        br = _clamp_bitrate(bit_rate, 32_000, 512_000, 192_000)
+        return ["-c:a", "aac", "-b:a", str(br)]
+    if ext in (".ogg", ".oga"):
+        br = _clamp_bitrate(bit_rate, 45_000, 500_000, 160_000)
+        return ["-c:a", "libvorbis", "-b:a", str(br)]
+    if ext == ".opus":
+        br = _clamp_bitrate(bit_rate, 6_000, 510_000, 128_000)
+        return ["-c:a", "libopus", "-b:a", str(br)]
+    if ext in (".aiff", ".aif"):
+        if bit_depth == 24:
+            return ["-c:a", "pcm_s24be"]
+        if bit_depth == 32:
+            return ["-c:a", "pcm_s32be"]
+        return ["-c:a", "pcm_s16be"]
+    if ext == ".wma":
+        br = _clamp_bitrate(bit_rate, 32_000, 384_000, 192_000)
+        return ["-c:a", "wmav2", "-b:a", str(br)]
+    return []
+
+
+def _measure_loudnorm(ffmpeg, path, target_i, target_tp, target_lra):
+    """loudnorm 第一遍：只测量，输出 JSON 到 stderr"""
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+        "-af",
+        f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, creationflags=_CREATIONFLAGS
+    )
+    text = result.stderr.decode(errors="ignore")
+    start = text.rfind("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise RuntimeError(f"loudnorm 测量失败: {text[-300:]}")
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"loudnorm 测量结果解析失败: {e}")
+
+
+def _backup_path_for(path, backup_dir):
+    """在 backup_dir 下用源文件路径的 md5 前缀命名，避免不同目录同名文件互相覆盖"""
+    p = Path(path)
+    h = hashlib.md5(str(p.resolve()).encode("utf-8")).hexdigest()[:12]
+    return Path(backup_dir) / f"{h}_{p.name}"
+
+
+def normalize_file(
+    ffmpeg, ffprobe, path,
+    target_i, target_tp, tolerance_lu,
+    backup_dir, measured_lufs=None, measured_tp=None,
+):
+    """把 path 原地做响度标准化：先备份到 backup_dir，再用 loudnorm 二次通过重编码覆盖原文件。
+    返回 (backup_path: Path, was_processed: bool)。
+    跳过条件：LUFS 已在目标 ± 容差内 **且** 真实峰值 ≤ 目标 TP；任一项超标都要跑一遍 loudnorm。"""
+    path = Path(path)
+    Path(backup_dir).mkdir(parents=True, exist_ok=True)
+    backup_path = _backup_path_for(path, backup_dir)
+    shutil.copy2(path, backup_path)
+
+    lufs_ok = (
+        measured_lufs is not None
+        and measured_lufs != float("-inf")
+        and abs(measured_lufs - target_i) <= tolerance_lu
+    )
+    # TP 缺失时按"未超标"处理，避免因为测量失败反复重编码；两者都合规才跳过
+    tp_ok = (
+        measured_tp is None
+        or measured_tp == float("-inf")
+        or measured_tp <= target_tp
+    )
+    if lufs_ok and tp_ok:
+        return backup_path, False
+
+    stats = _measure_loudnorm(ffmpeg, path, target_i, target_tp, LOUDNORM_TARGET_LRA)
+
+    # 过安静的素材（近乎无声）无法做有意义的标准化，跳过即可
+    try:
+        input_i = float(stats.get("input_i", "-inf"))
+    except (TypeError, ValueError):
+        input_i = float("-inf")
+    if input_i <= -70.0 or input_i == float("-inf"):
+        return backup_path, False
+
+    meta = probe_file(ffprobe, path)
+    codec_args = _pick_output_codec(path.suffix, meta)
+
+    tmp_out = path.with_name(f".__loudnorm_tmp__{path.name}")
+
+    af = (
+        f"loudnorm=I={target_i}:TP={target_tp}:LRA={LOUDNORM_TARGET_LRA}"
+        f":measured_I={stats.get('input_i', 0)}"
+        f":measured_TP={stats.get('input_tp', 0)}"
+        f":measured_LRA={stats.get('input_lra', 0)}"
+        f":measured_thresh={stats.get('input_thresh', -70)}"
+        f":offset={stats.get('target_offset', 0)}"
+        f":linear=true"
+        f":print_format=summary"
+    )
+
+    cmd = [ffmpeg, "-y", "-hide_banner", "-v", "error", "-i", str(path), "-af", af]
+    if meta.get("sample_rate"):
+        # loudnorm 内部工作在 192kHz，不指定 -ar 会把输出采样率改成 192kHz
+        cmd += ["-ar", str(meta["sample_rate"])]
+    cmd += codec_args
+    cmd += [str(tmp_out)]
+
+    result = subprocess.run(cmd, capture_output=True, creationflags=_CREATIONFLAGS)
+    if result.returncode != 0 or not tmp_out.exists():
+        if tmp_out.exists():
+            try:
+                tmp_out.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"loudnorm 处理失败: {result.stderr.decode(errors='ignore')[:300]}"
+        )
+
+    os.replace(tmp_out, path)
+    return backup_path, True
+
+
+def restore_backup(backup_path, original_path):
+    """还原原文件，覆盖已被标准化的版本"""
+    shutil.move(str(backup_path), str(original_path))
+
+
 def write_excel(rows, out_path):
     wb = Workbook()
     ws = wb.active
@@ -372,19 +560,31 @@ def write_excel(rows, out_path):
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True,
+        )
+    # 表头行加高一档，让两行文字（名称 + 单位）都能显示完整
+    ws.row_dimensions[1].height = 32
     ws.freeze_panes = "A2"
 
     clip_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     error_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 
+    # 除文件名列（HEADERS 中第 2 列）外全部居中；文件名保持默认左对齐便于阅读
+    center_align = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+    filename_col = 2
+
     for i, row in enumerate(rows, start=1):
         ws.append(build_excel_row(i, row))
+        r = ws.max_row
+        for cell in ws[r]:
+            cell.alignment = left_align if cell.column == filename_col else center_align
         if row.get("error"):
-            for cell in ws[ws.max_row]:
+            for cell in ws[r]:
                 cell.fill = error_fill
         elif row["data"]["clip_count"] > 0:
-            for cell in ws[ws.max_row]:
+            for cell in ws[r]:
                 cell.fill = clip_fill
 
     widths = [6, 28, 10, 10, 8, 10, 11, 14, 14, 13, 15, 15, 11, 12, 10, 9, 30]
