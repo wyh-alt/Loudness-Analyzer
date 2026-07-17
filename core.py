@@ -9,7 +9,6 @@ import re
 import sys
 import json
 import shutil
-import hashlib
 import subprocess
 from pathlib import Path
 
@@ -357,11 +356,18 @@ def build_excel_row(i, row):
 
 
 def build_table_row(row):
-    """把一条分析结果转换成 UI 表格显示行（列顺序对应 TABLE_HEADERS）"""
+    """把一条分析结果转换成 UI 表格显示行（列顺序对应 TABLE_HEADERS）。
+    row 可能是三种状态：
+    - {name, dir}：仅列出，未检测 —— 除文件名列外全部留空
+    - {name, dir, error}：检测/处理失败 —— 错误信息放在最后一列
+    - {name, dir, data}：已检测/已处理 —— 各指标格式化后填入"""
     if row.get("error"):
         return [row["name"], "", "", "", "", "", "", "", row["error"]]
 
-    d = row["data"]
+    d = row.get("data")
+    if not d:
+        return [row["name"]] + [""] * 8
+
     return [
         row["name"],
         fmt_seconds(d["duration"]),
@@ -462,91 +468,157 @@ def _measure_loudnorm(ffmpeg, path, target_i, target_tp, target_lra):
         raise RuntimeError(f"loudnorm 测量结果解析失败: {e}")
 
 
-def _backup_path_for(path, backup_dir):
-    """在 backup_dir 下用源文件路径的 md5 前缀命名，避免不同目录同名文件互相覆盖"""
-    p = Path(path)
-    h = hashlib.md5(str(p.resolve()).encode("utf-8")).hexdigest()[:12]
-    return Path(backup_dir) / f"{h}_{p.name}"
+# 格式标准化：UI 里下拉框对应的固定选项集
+FORMAT_LOSSLESS = {".wav", ".flac"}
+FORMAT_LOSSY = {".mp3", ".m4a"}
 
 
-def normalize_file(
-    ffmpeg, ffprobe, path,
-    target_i, target_tp, tolerance_lu,
-    backup_dir, measured_lufs=None, measured_tp=None,
+def _codec_args_for_format(ext, bit_depth=None, bit_rate=None):
+    """给定输出扩展名 + 位深/码率（按格式类型二选一），返回 ffmpeg codec 参数。
+    比 _pick_output_codec 更明确 —— 前者是"跟随源"，这里是"用户指定"。"""
+    ext = ext.lower()
+    if ext == ".wav":
+        if bit_depth == 24:
+            return ["-c:a", "pcm_s24le"]
+        if bit_depth == 32:
+            return ["-c:a", "pcm_s32le"]
+        return ["-c:a", "pcm_s16le"]
+    if ext == ".flac":
+        return ["-c:a", "flac", "-sample_fmt", "s32" if (bit_depth and bit_depth >= 24) else "s16"]
+    if ext == ".mp3":
+        br = int(bit_rate or 192_000)
+        return ["-c:a", "libmp3lame", "-b:a", str(br)]
+    if ext in (".m4a", ".aac"):
+        br = int(bit_rate or 192_000)
+        return ["-c:a", "aac", "-b:a", str(br)]
+    return []
+
+
+def _resolve_output_path(src_path, dst_dir, out_ext):
+    """决定输出到 dst_dir 里的哪个文件名；扩展名不同时无需担心冲突，同扩展名+同目录 = 与源重名时加后缀避让"""
+    src = Path(src_path)
+    dst_dir = Path(dst_dir)
+    dst = dst_dir / f"{src.stem}{out_ext}"
+    # 如果输出会覆盖源文件本身（同扩展名 + 用户把输出目录选成了源目录），换个后缀避让
+    try:
+        same_as_src = dst.resolve() == src.resolve()
+    except OSError:
+        same_as_src = False
+    if same_as_src:
+        dst = dst_dir / f"{src.stem}_normalized{out_ext}"
+    return dst
+
+
+def process_file(
+    ffmpeg, ffprobe, src_path, dst_dir,
+    *,
+    normalize_loudness=False,
+    target_i=None, target_tp=None, tolerance_lu=None,
+    measured_lufs=None, measured_tp=None,
+    format_config=None,
 ):
-    """把 path 原地做响度标准化：先备份到 backup_dir，再用 loudnorm 二次通过重编码覆盖原文件。
-    返回 (backup_path: Path, was_processed: bool)。
-    跳过条件：LUFS 已在目标 ± 容差内 **且** 真实峰值 ≤ 目标 TP；任一项超标都要跑一遍 loudnorm。"""
-    path = Path(path)
-    Path(backup_dir).mkdir(parents=True, exist_ok=True)
-    backup_path = _backup_path_for(path, backup_dir)
-    shutil.copy2(path, backup_path)
+    """把 src_path 处理后另存到 dst_dir。source 保持不变。
+    - normalize_loudness=True 时走 loudnorm 二次通过（LUFS 已在容差且 TP 合规就跳过 loudnorm）
+    - format_config is not None 时按 dict 指定的格式/采样率/位深或码率/声道 重新封装编码
+    - 两者都为假：直接 copy 到目标目录
+    返回 (dst_path: Path, loudnorm_applied: bool, converted: bool)"""
+    src = Path(src_path)
+    src_meta = probe_file(ffprobe, src)
 
+    # 决定输出扩展名与目标路径
+    out_ext = (format_config or {}).get("ext") or src.suffix.lower()
+    if not out_ext.startswith("."):
+        out_ext = "." + out_ext
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    dst = _resolve_output_path(src, dst_dir, out_ext)
+
+    # 判断是否需要跑 loudnorm
     lufs_ok = (
         measured_lufs is not None
         and measured_lufs != float("-inf")
+        and target_i is not None
+        and tolerance_lu is not None
         and abs(measured_lufs - target_i) <= tolerance_lu
     )
-    # TP 缺失时按"未超标"处理，避免因为测量失败反复重编码；两者都合规才跳过
     tp_ok = (
-        measured_tp is None
+        target_tp is None
+        or measured_tp is None
         or measured_tp == float("-inf")
         or measured_tp <= target_tp
     )
-    if lufs_ok and tp_ok:
-        return backup_path, False
+    need_loudnorm = normalize_loudness and not (lufs_ok and tp_ok)
 
-    stats = _measure_loudnorm(ffmpeg, path, target_i, target_tp, LOUDNORM_TARGET_LRA)
+    # 都不做：直接复制
+    if not need_loudnorm and not format_config:
+        shutil.copy2(src, dst)
+        return dst, False, False
 
-    # 过安静的素材（近乎无声）无法做有意义的标准化，跳过即可
-    try:
-        input_i = float(stats.get("input_i", "-inf"))
-    except (TypeError, ValueError):
-        input_i = float("-inf")
-    if input_i <= -70.0 or input_i == float("-inf"):
-        return backup_path, False
+    # 格式配置：优先用用户指定值，缺失时保留源参数
+    if format_config:
+        out_sr = format_config.get("sample_rate") or src_meta.get("sample_rate")
+        out_ch = format_config.get("channels") or src_meta.get("channels")
+        codec_args = _codec_args_for_format(
+            out_ext,
+            bit_depth=format_config.get("bit_depth"),
+            bit_rate=format_config.get("bit_rate"),
+        )
+    else:
+        out_sr = src_meta.get("sample_rate")
+        out_ch = src_meta.get("channels")
+        codec_args = _pick_output_codec(out_ext, src_meta)
 
-    meta = probe_file(ffprobe, path)
-    codec_args = _pick_output_codec(path.suffix, meta)
+    # loudnorm filter chain
+    af = None
+    if need_loudnorm:
+        stats = _measure_loudnorm(
+            ffmpeg, src, target_i, target_tp, LOUDNORM_TARGET_LRA
+        )
+        try:
+            input_i = float(stats.get("input_i", "-inf"))
+        except (TypeError, ValueError):
+            input_i = float("-inf")
+        # 素材几乎无声：跳过 loudnorm 步骤，但仍做格式转换（如果启用）
+        if input_i <= -70.0 or input_i == float("-inf"):
+            need_loudnorm = False
+        else:
+            af = (
+                f"loudnorm=I={target_i}:TP={target_tp}:LRA={LOUDNORM_TARGET_LRA}"
+                f":measured_I={stats.get('input_i', 0)}"
+                f":measured_TP={stats.get('input_tp', 0)}"
+                f":measured_LRA={stats.get('input_lra', 0)}"
+                f":measured_thresh={stats.get('input_thresh', -70)}"
+                f":offset={stats.get('target_offset', 0)}"
+                f":linear=true"
+                f":print_format=summary"
+            )
 
-    tmp_out = path.with_name(f".__loudnorm_tmp__{path.name}")
+    # 只需要 loudnorm 被跳过 + 也没有格式转换 = 直接 copy
+    if not need_loudnorm and not format_config:
+        shutil.copy2(src, dst)
+        return dst, False, False
 
-    af = (
-        f"loudnorm=I={target_i}:TP={target_tp}:LRA={LOUDNORM_TARGET_LRA}"
-        f":measured_I={stats.get('input_i', 0)}"
-        f":measured_TP={stats.get('input_tp', 0)}"
-        f":measured_LRA={stats.get('input_lra', 0)}"
-        f":measured_thresh={stats.get('input_thresh', -70)}"
-        f":offset={stats.get('target_offset', 0)}"
-        f":linear=true"
-        f":print_format=summary"
-    )
-
-    cmd = [ffmpeg, "-y", "-hide_banner", "-v", "error", "-i", str(path), "-af", af]
-    if meta.get("sample_rate"):
-        # loudnorm 内部工作在 192kHz，不指定 -ar 会把输出采样率改成 192kHz
-        cmd += ["-ar", str(meta["sample_rate"])]
+    cmd = [ffmpeg, "-y", "-hide_banner", "-v", "error", "-i", str(src)]
+    if af:
+        cmd += ["-af", af]
+    if out_sr:
+        cmd += ["-ar", str(out_sr)]
+    if out_ch:
+        cmd += ["-ac", str(out_ch)]
     cmd += codec_args
-    cmd += [str(tmp_out)]
+    cmd += [str(dst)]
 
     result = subprocess.run(cmd, capture_output=True, creationflags=_CREATIONFLAGS)
-    if result.returncode != 0 or not tmp_out.exists():
-        if tmp_out.exists():
+    if result.returncode != 0 or not dst.exists():
+        if dst.exists():
             try:
-                tmp_out.unlink()
+                dst.unlink()
             except OSError:
                 pass
         raise RuntimeError(
-            f"loudnorm 处理失败: {result.stderr.decode(errors='ignore')[:300]}"
+            f"处理失败: {result.stderr.decode(errors='ignore')[:300]}"
         )
 
-    os.replace(tmp_out, path)
-    return backup_path, True
-
-
-def restore_backup(backup_path, original_path):
-    """还原原文件，覆盖已被标准化的版本"""
-    shutil.move(str(backup_path), str(original_path))
+    return dst, bool(af), bool(format_config)
 
 
 def write_excel(rows, out_path):

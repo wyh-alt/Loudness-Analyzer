@@ -7,7 +7,6 @@
 import os
 import sys
 import ctypes
-import shutil
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -22,11 +21,12 @@ from PyQt6.QtWidgets import (
     QPushButton, QProgressBar, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QStyledItemDelegate, QStyle, QSplashScreen, QCheckBox, QDoubleSpinBox,
+    QComboBox,
 )
 
 from core import (
     analyze_file, scan_folder, write_excel, find_tool, build_table_row,
-    normalize_file, restore_backup, TABLE_HEADERS,
+    process_file, FORMAT_LOSSLESS, FORMAT_LOSSY, TABLE_HEADERS,
 )
 
 # PyInstaller onefile 会把资源解压到 sys._MEIPASS；开发模式下按脚本目录取即可
@@ -466,18 +466,17 @@ class ResultsTable(QTableWidget):
             self._suppress_fit = False
 
 
-class ScanWorker(QThread):
+class AnalyzeWorker(QThread):
+    """给已列出的 rows 逐首跑 analyze_file，把响度指标回填到 row["data"]"""
     progress = pyqtSignal(int, int, str)
-    row_ready = pyqtSignal(dict)
-    finished_ok = pyqtSignal(str, int, int)
+    row_updated = pyqtSignal(int, dict)
+    finished_ok = pyqtSignal(int, int)  # total, error_count
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, folders, out_path, ffmpeg, ffprobe):
+    def __init__(self, rows, ffmpeg, ffprobe):
         super().__init__()
-        self.folders = folders
-        # out_path 为 None 时仅扫描并显示到表格，不落 Excel（响度标准化模式的初始载入）
-        self.out_path = out_path
+        self.rows = rows
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self._cancel = False
@@ -486,64 +485,48 @@ class ScanWorker(QThread):
         self._cancel = True
 
     def run(self):
-        try:
-            files = scan_folder(self.folders)
-        except Exception as e:
-            self.failed.emit(f"扫描失败: {e}")
-            return
-
-        total = len(files)
-        if total == 0:
-            self.failed.emit("未找到可识别的音频文件，请检查选择的文件/文件夹。")
-            return
-
-        rows = []
-        error_count = 0
-        for idx, path in enumerate(files, start=1):
+        total = len(self.rows)
+        errors = 0
+        for idx, row in enumerate(self.rows):
             if self._cancel:
                 self.cancelled.emit()
                 return
-            self.progress.emit(idx, total, str(path))
+            path = Path(row["dir"]) / row["name"]
+            self.progress.emit(idx + 1, total, str(path))
             try:
                 data = analyze_file(self.ffmpeg, self.ffprobe, path)
-                row = {"name": path.name, "dir": str(path.parent), "data": data}
+                new_row = {"name": path.name, "dir": str(path.parent), "data": data}
             except Exception as e:
-                error_count += 1
-                row = {"name": path.name, "dir": str(path.parent), "error": str(e)}
-            rows.append(row)
-            self.row_ready.emit(row)
-
-        if self.out_path:
-            try:
-                write_excel(rows, self.out_path)
-            except Exception as e:
-                self.failed.emit(f"写入 Excel 失败: {e}")
-                return
-
-        self.finished_ok.emit(self.out_path or "", total, error_count)
+                errors += 1
+                new_row = {"name": path.name, "dir": str(path.parent), "error": str(e)}
+            self.row_updated.emit(idx, new_row)
+        self.finished_ok.emit(total, errors)
 
 
-class NormalizeWorker(QThread):
+class ProcessWorker(QThread):
+    """逐首另存处理：可选响度标准化 + 可选格式转换。
+    源文件不会被改动，处理产物写到 out_dir，处理后重扫产物拿到新指标回填表格。"""
     progress = pyqtSignal(int, int, str)
     row_updated = pyqtSignal(int, dict)
-    backup_registered = pyqtSignal(str, str)  # original_path, backup_path
-    finished_ok = pyqtSignal(str, int, int, int)  # out_path, total, processed, errors
+    finished_ok = pyqtSignal(str, int, int, int)  # out_dir, total, processed, errors
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
     def __init__(
-        self, rows, out_path, ffmpeg, ffprobe,
-        target_i, target_tp, tolerance_lu, backup_dir,
+        self, rows, out_dir, ffmpeg, ffprobe,
+        *, normalize_loudness, target_i, target_tp, tolerance_lu,
+        format_config,
     ):
         super().__init__()
         self.rows = rows
-        self.out_path = out_path
+        self.out_dir = out_dir
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
+        self.normalize_loudness = normalize_loudness
         self.target_i = target_i
         self.target_tp = target_tp
         self.tolerance_lu = tolerance_lu
-        self.backup_dir = backup_dir
+        self.format_config = format_config
         self._cancel = False
 
     def cancel(self):
@@ -552,56 +535,51 @@ class NormalizeWorker(QThread):
     def run(self):
         total = len(self.rows)
         processed = 0
-        error_count = 0
-        result_rows = []
+        errors = 0
 
         for idx, row in enumerate(self.rows):
             if self._cancel:
                 self.cancelled.emit()
                 return
 
-            path = Path(row["dir"]) / row["name"]
-            self.progress.emit(idx + 1, total, str(path))
+            src_path = Path(row["dir"]) / row["name"]
+            self.progress.emit(idx + 1, total, str(src_path))
 
             if row.get("error"):
-                # 之前扫描就失败的直接保留原错误信息，不再尝试标准化
-                result_rows.append(row)
-                continue
+                # 之前分析就失败的：不能拿到 measured；仍然试一次处理，让 loudnorm 自己测
+                pass
 
-            data = row.get("data", {}) or {}
+            data = row.get("data") or {}
             measured_lufs = data.get("lufs_i")
             measured_tp = data.get("true_peak_db")
+
             try:
-                backup, was_processed = normalize_file(
-                    self.ffmpeg, self.ffprobe, path,
-                    self.target_i, self.target_tp, self.tolerance_lu,
-                    backup_dir=self.backup_dir,
+                dst, loudnorm_applied, converted = process_file(
+                    self.ffmpeg, self.ffprobe, src_path, self.out_dir,
+                    normalize_loudness=self.normalize_loudness,
+                    target_i=self.target_i,
+                    target_tp=self.target_tp,
+                    tolerance_lu=self.tolerance_lu,
                     measured_lufs=measured_lufs,
                     measured_tp=measured_tp,
+                    format_config=self.format_config,
                 )
-                self.backup_registered.emit(str(path), str(backup))
-                if was_processed:
+                if loudnorm_applied or converted:
                     processed += 1
-                    new_data = analyze_file(self.ffmpeg, self.ffprobe, path)
-                    new_row = {"name": path.name, "dir": str(path.parent), "data": new_data}
-                else:
-                    new_row = row
+                # 处理后的文件重新走一遍分析，把新指标回填表格
+                new_data = analyze_file(self.ffmpeg, self.ffprobe, dst)
+                new_row = {
+                    "name": dst.name,
+                    "dir": str(dst.parent),
+                    "data": new_data,
+                }
             except Exception as e:
-                error_count += 1
-                new_row = {"name": path.name, "dir": str(path.parent), "error": str(e)}
+                errors += 1
+                new_row = {"name": src_path.name, "dir": str(src_path.parent), "error": str(e)}
 
-            result_rows.append(new_row)
             self.row_updated.emit(idx, new_row)
 
-        # xlsx 由主界面"导出表格"按钮触发，worker 不再直接落盘
-        if self.out_path:
-            try:
-                write_excel(result_rows, self.out_path)
-            except Exception as e:
-                self.failed.emit(f"写入 Excel 失败: {e}")
-                return
-
-        self.finished_ok.emit(self.out_path or "", total, processed, error_count)
+        self.finished_ok.emit(str(self.out_dir), total, processed, errors)
 
 
 class MainWindow(QWidget):
@@ -619,11 +597,8 @@ class MainWindow(QWidget):
         self.worker = None
         self._accent_color = _LIGHT["accent"]  # 由 set_theme() 跟随主题更新，用于选中单元格边框
 
-        # 响度标准化相关状态
-        self._loaded_rows = []          # 与表格顺序一一对应的分析结果
-        self._backups = {}              # 已备份的原文件 {原路径: 备份路径}
-        self._backup_dir = None         # 本轮标准化用的临时备份目录
-        self._norm_state = "idle"       # "idle" 或 "processed"（决定按钮是"开始处理"还是"撤销处理"）
+        # 表格数据：每行是 {name, dir} / {name, dir, data} / {name, dir, error}
+        self._loaded_rows = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -676,7 +651,10 @@ class MainWindow(QWidget):
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
 
-        # 响度标准化设置区（复选框 + 参数同排，节省纵向空间）
+        SPIN_W = 100  # 数值+单位（"-12.0 LUFS"/"-1.0 dBTP"）+ 右侧上下按钮全部完整可见
+        COMBO_W = 100
+
+        # 响度标准化行：复选框 + 目标响度 / 容差 / 最高实际峰值
         norm_row = QHBoxLayout()
         norm_row.setSpacing(16)
 
@@ -690,8 +668,6 @@ class MainWindow(QWidget):
         params_row = QHBoxLayout(self.norm_params_widget)
         params_row.setContentsMargins(0, 0, 0, 0)
         params_row.setSpacing(6)
-
-        SPIN_W = 100  # 数值+单位（"-12.0 LUFS"/"-1.0 dBTP"）+ 右侧上下按钮全部完整可见
 
         params_row.addWidget(QLabel("目标响度:", self))
         self.target_i_spin = QDoubleSpinBox(self)
@@ -734,8 +710,77 @@ class MainWindow(QWidget):
         self.norm_params_widget.setEnabled(self.normalize_cb.isChecked())
         norm_row.addWidget(self.norm_params_widget)
         norm_row.addStretch(1)
+        layout.addLayout(norm_row)
 
-        # 状态文本单独占一行（在标准化设置行上方），把纵向节奏拉开
+        # 格式标准化行：复选框 + 音频格式 / 采样率 / 位深(仅无损) 或 码率(仅有损) / 声道
+        fmt_row = QHBoxLayout()
+        fmt_row.setSpacing(16)
+
+        self.format_cb = QCheckBox("格式标准化", self)
+        self.format_cb.setObjectName("normalizeCheck")
+        self.format_cb.setChecked(False)
+        fmt_row.addWidget(self.format_cb)
+
+        self.fmt_params_widget = QWidget(self)
+        self.fmt_params_widget.setObjectName("normParams")
+        fmt_params = QHBoxLayout(self.fmt_params_widget)
+        fmt_params.setContentsMargins(0, 0, 0, 0)
+        fmt_params.setSpacing(6)
+
+        fmt_params.addWidget(QLabel("音频格式:", self))
+        self.format_combo = QComboBox(self)
+        self.format_combo.setObjectName("normCombo")
+        for label, ext in [(".wav", ".wav"), (".mp3", ".mp3"), (".m4a", ".m4a"), (".flac", ".flac")]:
+            self.format_combo.addItem(label, ext)
+        self.format_combo.setFixedWidth(COMBO_W)
+        fmt_params.addWidget(self.format_combo)
+
+        fmt_params.addSpacing(16)
+        fmt_params.addWidget(QLabel("采样率:", self))
+        self.sr_combo = QComboBox(self)
+        self.sr_combo.setObjectName("normCombo")
+        for label, val in [("44100 Hz", 44100), ("48000 Hz", 48000)]:
+            self.sr_combo.addItem(label, val)
+        self.sr_combo.setFixedWidth(COMBO_W)
+        fmt_params.addWidget(self.sr_combo)
+
+        # 位深（仅无损时显示）
+        fmt_params.addSpacing(16)
+        self.bit_depth_label = QLabel("位深度:", self)
+        fmt_params.addWidget(self.bit_depth_label)
+        self.bit_depth_combo = QComboBox(self)
+        self.bit_depth_combo.setObjectName("normCombo")
+        for label, val in [("16 Bit", 16), ("24 Bit", 24), ("32 Bit", 32)]:
+            self.bit_depth_combo.addItem(label, val)
+        self.bit_depth_combo.setFixedWidth(COMBO_W)
+        fmt_params.addWidget(self.bit_depth_combo)
+
+        # 码率（仅有损时显示）
+        self.bit_rate_label = QLabel("比特率:", self)
+        fmt_params.addWidget(self.bit_rate_label)
+        self.bit_rate_combo = QComboBox(self)
+        self.bit_rate_combo.setObjectName("normCombo")
+        for label, val in [("320 kbps", 320_000), ("256 kbps", 256_000),
+                           ("192 kbps", 192_000), ("128 kbps", 128_000), ("64 kbps", 64_000)]:
+            self.bit_rate_combo.addItem(label, val)
+        self.bit_rate_combo.setFixedWidth(COMBO_W)
+        fmt_params.addWidget(self.bit_rate_combo)
+
+        fmt_params.addSpacing(16)
+        fmt_params.addWidget(QLabel("声道:", self))
+        self.channels_combo = QComboBox(self)
+        self.channels_combo.setObjectName("normCombo")
+        for label, val in [("立体声", 2), ("单声道", 1)]:
+            self.channels_combo.addItem(label, val)
+        self.channels_combo.setFixedWidth(COMBO_W)
+        fmt_params.addWidget(self.channels_combo)
+
+        self.fmt_params_widget.setEnabled(self.format_cb.isChecked())
+        fmt_row.addWidget(self.fmt_params_widget)
+        fmt_row.addStretch(1)
+        layout.addLayout(fmt_row)
+
+        # 状态行 + 主按钮
         status_row = QHBoxLayout()
         self.status_label = QLabel("就绪", self)
         self.status_label.setObjectName("statusLabel")
@@ -743,98 +788,187 @@ class MainWindow(QWidget):
         status_row.addStretch(1)
         layout.addLayout(status_row)
 
-        # 响度标准化行与"导出表格 / 取消 / 开始处理"按钮同排
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
         self.export_btn = QPushButton("导出表格", self)
         self.export_btn.setObjectName("browseBtn")
         self.export_btn.setEnabled(False)  # 表格空时禁用；有数据后自动启用
+        self.measure_btn = QPushButton("响度统计", self)
+        self.measure_btn.setObjectName("browseBtn")
+        self.measure_btn.setEnabled(False)
         self.cancel_btn = QPushButton("取消", self)
         self.cancel_btn.setObjectName("cancelBtn")
         self.cancel_btn.setEnabled(False)
         self.start_btn = QPushButton("开始处理", self)
         self.start_btn.setObjectName("startBtn")
-        norm_row.addWidget(self.export_btn)
-        norm_row.addWidget(self.cancel_btn)
-        norm_row.addWidget(self.start_btn)
-        layout.addLayout(norm_row)
+        self.start_btn.setEnabled(False)
+        btn_row.addWidget(self.export_btn)
+        btn_row.addWidget(self.measure_btn)
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addWidget(self.start_btn)
+        layout.addLayout(btn_row)
 
         self.browse_btn.clicked.connect(self.on_browse)
         self.start_btn.clicked.connect(self.on_start)
         self.cancel_btn.clicked.connect(self.on_cancel)
         self.export_btn.clicked.connect(self.on_export)
+        self.measure_btn.clicked.connect(self.on_measure)
         self.path_edit.dropped.connect(self.on_path_dropped)
         self.normalize_cb.toggled.connect(self.on_normalize_toggled)
-        self.target_i_spin.valueChanged.connect(self.on_norm_param_changed)
-        self.tolerance_spin.valueChanged.connect(self.on_norm_param_changed)
-        self.max_tp_spin.valueChanged.connect(self.on_norm_param_changed)
+        self.format_cb.toggled.connect(self.on_format_toggled)
+        self.format_combo.currentIndexChanged.connect(self._sync_format_specific_visibility)
 
-        self._update_start_button()
+        # 初始应用一次"位深/码率随格式切换"的联动
+        self._sync_format_specific_visibility()
 
         if not self.ffmpeg or not self.ffprobe:
             self.start_btn.setEnabled(False)
+            self.measure_btn.setEnabled(False)
             self.status_label.setText("缺少依赖：未检测到 ffmpeg / ffprobe，请安装后加入系统 PATH")
 
     def on_browse(self):
         folder = QFileDialog.getExistingDirectory(self, "选择包含音频文件的文件夹")
         if folder:
             self.path_edit.set_paths([folder])
+            self.on_path_dropped()
 
-    # ---------------- 响度标准化设置区交互 ----------------
+    # ---------------- 参数区交互 ----------------
 
     def on_normalize_toggled(self, checked):
-        # 参数区始终显示，仅根据是否勾选决定能否编辑（未勾选时整体置灰不可交互）
         self.norm_params_widget.setEnabled(checked)
-        # 切换模式后按钮语义变化；不改变已有备份，避免用户误操作丢失撤销能力
-        self._update_start_button()
 
-    def on_norm_param_changed(self, _value):
-        # 只有当已经完成标准化（存在可撤销状态）时，参数变更才需要重置回"开始处理"
-        if self._norm_state == "processed":
-            self._discard_backups()
-            self._norm_state = "idle"
-            self._update_start_button()
-            self.status_label.setText("参数已调整，撤销状态已失效")
+    def on_format_toggled(self, checked):
+        self.fmt_params_widget.setEnabled(checked)
 
-    def _update_start_button(self):
-        if self.normalize_cb.isChecked() and self._norm_state == "processed":
-            self.start_btn.setText("撤销处理")
+    def _sync_format_specific_visibility(self, *_):
+        """格式切换：无损（wav/flac）显位深、隐码率；有损（mp3/m4a）反之"""
+        ext = self.format_combo.currentData()
+        is_lossless = ext in FORMAT_LOSSLESS
+        self.bit_depth_label.setVisible(is_lossless)
+        self.bit_depth_combo.setVisible(is_lossless)
+        self.bit_rate_label.setVisible(not is_lossless)
+        self.bit_rate_combo.setVisible(not is_lossless)
+
+    def _current_format_config(self):
+        """把格式参数装成 process_file 用的 dict；未勾选时返回 None"""
+        if not self.format_cb.isChecked():
+            return None
+        ext = self.format_combo.currentData()
+        cfg = {
+            "ext": ext,
+            "sample_rate": self.sr_combo.currentData(),
+            "channels": self.channels_combo.currentData(),
+        }
+        if ext in FORMAT_LOSSLESS:
+            cfg["bit_depth"] = self.bit_depth_combo.currentData()
         else:
-            self.start_btn.setText("开始处理")
+            cfg["bit_rate"] = self.bit_rate_combo.currentData()
+        return cfg
 
-    def _discard_backups(self):
-        """清空当前的备份记录并删除临时备份目录（不还原文件）"""
-        self._backups.clear()
-        if self._backup_dir and os.path.isdir(self._backup_dir):
-            shutil.rmtree(self._backup_dir, ignore_errors=True)
-        self._backup_dir = None
+    # ---------------- 拖入 / 响度统计 / 开始处理 ----------------
 
     def on_path_dropped(self):
+        """拖入或点浏览：只把音频路径列进表格，不做检测"""
         if self.worker and self.worker.isRunning():
             return
-        if not self.start_btn.isEnabled():
+        paths = self.path_edit.current_paths()
+        if not paths:
             return
-        # 新素材载入意味着旧备份对应的路径可能不再是"当前处理集"，直接丢弃
-        if self._backups:
-            self._discard_backups()
-        self._norm_state = "idle"
-        self._update_start_button()
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            QMessageBox.warning(self, "错误", "以下路径不存在：\n" + "\n".join(missing))
+            return
+        try:
+            files = scan_folder(paths)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"扫描失败: {e}")
+            return
+        if not files:
+            QMessageBox.warning(self, "提示", "未找到可识别的音频文件。")
+            return
 
-        # 拖入只做检测 + 表格显示；xlsx 由"导出表格"按钮触发，不再自动落盘
-        self._start_scan(out_path=None)
+        self.table.setRowCount(0)
+        self._loaded_rows = []
+        for p in files:
+            row = {"name": p.name, "dir": str(p.parent)}
+            self._loaded_rows.append(row)
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self._fill_row(r, build_table_row(row))
+        self.progress_bar.setValue(0)
+        self.status_label.setText(
+            f"已列出 {len(files)} 个文件；点「响度统计」检测响度，或直接「开始处理」（处理时自动检测）"
+        )
+        self.export_btn.setEnabled(True)
+        self.measure_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
+        self.start_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
+
+    def on_measure(self):
+        """响度统计：对当前 loaded_rows 逐首跑 analyze_file"""
+        if self.worker and self.worker.isRunning():
+            return
+        if not self._loaded_rows:
+            QMessageBox.warning(self, "提示", "请先拖入音频。")
+            return
+        self.progress_bar.setValue(0)
+        self.measure_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText("准备检测响度...")
+        self.worker = AnalyzeWorker(list(self._loaded_rows), self.ffmpeg, self.ffprobe)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.row_updated.connect(self.on_row_updated)
+        self.worker.finished_ok.connect(self.on_measure_finished)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.cancelled.connect(self.on_cancelled)
+        self.worker.start()
 
     def on_start(self):
-        # 撤销模式：还原备份并回到"开始处理"状态
-        if self.normalize_cb.isChecked() and self._norm_state == "processed":
-            self._start_undo()
+        """开始处理：弹目录选择框 → 逐首 process_file 另存到该目录"""
+        if self.worker and self.worker.isRunning():
             return
-        # 标准化模式：对已载入的文件做批量标准化
-        if self.normalize_cb.isChecked():
-            self._start_normalize()
+        if not self._loaded_rows:
+            QMessageBox.warning(self, "提示", "请先拖入音频。")
             return
-        # 未勾选响度标准化：xlsx 在拖入时就已经落盘，按钮不再触发第二次生成
-        QMessageBox.information(
-            self, "提示",
-            "当前未选择响度标准化，音频无需处理。",
+        do_loudness = self.normalize_cb.isChecked()
+        format_cfg = self._current_format_config()
+        if not do_loudness and not format_cfg:
+            QMessageBox.information(
+                self, "提示",
+                "响度标准化和格式标准化都未启用，音频无需处理。",
+            )
+            return
+
+        # 弹出输出目录选择
+        first = self.path_edit.current_paths()[0] if self.path_edit.current_paths() else self._loaded_rows[0]["dir"]
+        default_dir = first if os.path.isdir(first) else os.path.dirname(first)
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "选择处理后音频的输出目录", default_dir,
         )
+        if not out_dir:
+            return
+
+        self.progress_bar.setValue(0)
+        self.start_btn.setEnabled(False)
+        self.measure_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText("准备处理...")
+        self.worker = ProcessWorker(
+            list(self._loaded_rows), out_dir, self.ffmpeg, self.ffprobe,
+            normalize_loudness=do_loudness,
+            target_i=self.target_i_spin.value(),
+            target_tp=self.max_tp_spin.value(),
+            tolerance_lu=self.tolerance_spin.value(),
+            format_config=format_cfg,
+        )
+        self.worker.progress.connect(self.on_progress)
+        self.worker.row_updated.connect(self.on_row_updated)
+        self.worker.finished_ok.connect(self.on_process_finished)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.cancelled.connect(self.on_cancelled)
+        self.worker.start()
 
     def _ask_excel_path(self, first_path):
         default_dir = first_path if os.path.isdir(first_path) else os.path.dirname(first_path)
@@ -845,99 +979,6 @@ class MainWindow(QWidget):
             "Excel 文件 (*.xlsx)",
         )
         return out_path or None
-
-    def _start_scan(self, out_path):
-        paths = self.path_edit.current_paths()
-        if not paths:
-            QMessageBox.warning(self, "提示", "请先拖入或选择一个音频文件/文件夹。")
-            return
-        missing = [p for p in paths if not os.path.exists(p)]
-        if missing:
-            QMessageBox.warning(self, "错误", "以下路径不存在：\n" + "\n".join(missing))
-            return
-
-        self.table.setRowCount(0)
-        self._loaded_rows = []
-        self.progress_bar.setValue(0)
-        self.start_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
-        self.export_btn.setEnabled(False)
-        self.status_label.setText("准备扫描...")
-        self.worker = ScanWorker(paths, out_path, self.ffmpeg, self.ffprobe)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.row_ready.connect(self.on_row_ready)
-        self.worker.finished_ok.connect(self.on_scan_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.cancelled.connect(self.on_cancelled)
-        self.worker.start()
-
-    def _start_normalize(self):
-        if not self._loaded_rows:
-            QMessageBox.warning(self, "提示", "请先拖入音频，等待载入分析完成后再开始处理。")
-            return
-        # 只统计能处理的行（错误行会跳过）
-        processable = [r for r in self._loaded_rows if not r.get("error")]
-        if not processable:
-            QMessageBox.warning(self, "提示", "载入的音频都无法分析，无法进行标准化。")
-            return
-
-        # 每轮标准化用一个独立的临时目录存放备份，撤销后整个删掉
-        self._backup_dir = tempfile.mkdtemp(prefix="loudness_norm_")
-        self._backups = {}
-
-        self.progress_bar.setValue(0)
-        self.start_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
-        self.export_btn.setEnabled(False)
-        self.status_label.setText("准备标准化...")
-        # xlsx 不再在处理阶段自动生成，交给"导出表格"按钮
-        self.worker = NormalizeWorker(
-            list(self._loaded_rows), None, self.ffmpeg, self.ffprobe,
-            target_i=self.target_i_spin.value(),
-            target_tp=self.max_tp_spin.value(),
-            tolerance_lu=self.tolerance_spin.value(),
-            backup_dir=self._backup_dir,
-        )
-        self.worker.progress.connect(self.on_progress)
-        self.worker.row_updated.connect(self.on_row_updated)
-        self.worker.backup_registered.connect(self.on_backup_registered)
-        self.worker.finished_ok.connect(self.on_normalize_finished)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.cancelled.connect(self.on_cancelled)
-        self.worker.start()
-
-    def _start_undo(self):
-        if not self._backups:
-            self._norm_state = "idle"
-            self._update_start_button()
-            return
-        self.start_btn.setEnabled(False)
-        self.status_label.setText("正在还原...")
-        QApplication.processEvents()
-
-        errors = []
-        total = len(self._backups)
-        for i, (original, backup) in enumerate(list(self._backups.items()), start=1):
-            self.status_label.setText(f"正在还原 ({i}/{total})：{os.path.basename(original)}")
-            QApplication.processEvents()
-            try:
-                if os.path.exists(backup):
-                    restore_backup(backup, original)
-            except Exception as e:
-                errors.append(f"{original}: {e}")
-
-        self._discard_backups()
-        self._norm_state = "idle"
-        # 还原后重新扫描一次，让表格里的响度指标回到原始值
-        self.status_label.setText("还原完成，正在重新分析...")
-        self._update_start_button()
-        self.start_btn.setEnabled(True)
-        if errors:
-            QMessageBox.warning(
-                self, "部分文件还原失败",
-                "以下文件还原时出错：\n" + "\n".join(errors[:20]),
-            )
-        self._start_scan(out_path=None)
 
     def on_cancel(self):
         if self.worker:
@@ -981,47 +1022,49 @@ class MainWindow(QWidget):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(r, col, item)
 
-    def on_row_ready(self, row):
-        self._loaded_rows.append(row)
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        self._fill_row(r, build_table_row(row))
-        self.table.scrollToBottom()
-
     def on_row_updated(self, idx, row):
         if 0 <= idx < len(self._loaded_rows):
             self._loaded_rows[idx] = row
         if 0 <= idx < self.table.rowCount():
             self._fill_row(idx, build_table_row(row))
 
-    def on_backup_registered(self, original, backup):
-        self._backups[original] = backup
-
     def _reset_buttons(self):
-        self.start_btn.setEnabled(True)
+        has_rows = bool(self._loaded_rows)
+        deps_ok = bool(self.ffmpeg and self.ffprobe)
+        self.start_btn.setEnabled(has_rows and deps_ok)
+        self.measure_btn.setEnabled(has_rows and deps_ok)
         self.cancel_btn.setEnabled(False)
-        # 有可导出内容时启用导出按钮
-        self.export_btn.setEnabled(bool(self._loaded_rows))
-        self._update_start_button()
+        self.export_btn.setEnabled(has_rows)
 
-    def on_scan_finished(self, out_path, total, error_count):
+    def on_measure_finished(self, total, error_count):
         self._reset_buttons()
         self.status_label.setText(
-            f"已载入 {total} 个文件，{error_count} 个失败；可点击「导出表格」保存 xlsx"
+            f"响度检测完成：共 {total} 个文件，{error_count} 个失败"
         )
 
-    def on_normalize_finished(self, out_path, total, processed, error_count):
-        # 只要有备份就允许撤销（即使全部因容差被跳过，撤销至少能把备份目录清掉）
-        self._norm_state = "processed" if self._backups else "idle"
+    def on_process_finished(self, out_dir, total, processed, error_count):
         self._reset_buttons()
         self.status_label.setText(
-            f"标准化完成：共 {total} 个文件，实际处理 {processed}，失败 {error_count}；"
-            f"可点击「导出表格」保存新 xlsx"
+            f"处理完成：共 {total} 个文件，实际处理 {processed}，失败 {error_count}"
         )
+        reply = QMessageBox.question(
+            self, "处理完成",
+            f"共 {total} 个文件，实际处理 {processed}，{error_count} 个失败。\n"
+            f"处理后的音频已保存到：\n{out_dir}\n\n是否打开该目录？",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            os.startfile(out_dir)
 
     def on_export(self):
         if not self._loaded_rows:
             QMessageBox.warning(self, "提示", "当前表格为空，请先拖入音频。")
+            return
+        with_data = [r for r in self._loaded_rows if r.get("data") or r.get("error")]
+        if not with_data:
+            QMessageBox.warning(
+                self, "提示",
+                "当前表格里没有响度数据可导出。请先点「响度统计」检测，或直接「开始处理」。",
+            )
             return
         paths = self.path_edit.current_paths()
         first = paths[0] if paths else self._loaded_rows[0]["dir"]
@@ -1029,7 +1072,7 @@ class MainWindow(QWidget):
         if not out_path:
             return
         try:
-            write_excel(list(self._loaded_rows), out_path)
+            write_excel(with_data, out_path)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"写入 Excel 失败：{e}")
             return
@@ -1042,24 +1085,13 @@ class MainWindow(QWidget):
             os.startfile(os.path.dirname(out_path))
 
     def on_failed(self, message):
-        # 标准化过程中出错但已经产生备份的话，保留撤销能力（例如仅 Excel 写入失败的情况）
-        if self._backups:
-            self._norm_state = "processed"
         self._reset_buttons()
         self.status_label.setText("出错")
         QMessageBox.critical(self, "错误", message)
 
     def on_cancelled(self):
-        # 用户取消标准化中途：已产生的备份先保留，允许通过撤销把已改过的文件还原
-        if self._backups:
-            self._norm_state = "processed"
         self._reset_buttons()
         self.status_label.setText("已取消")
-
-    def closeEvent(self, event):
-        # 关闭窗口时清理临时备份目录；不主动还原已被标准化的文件
-        self._discard_backups()
-        super().closeEvent(event)
 
     def set_theme(self, dark: bool):
         self._accent_color = (_DARK if dark else _LIGHT)["accent"]
