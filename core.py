@@ -45,19 +45,19 @@ class ProcCancelled(Exception):
 
 
 class CancelToken:
-    """把当前正在跑的 ffmpeg/ffprobe 进程绑到 token，cancel() 立即 kill，不再等它自然结束。
-    workers 每次进入 core 前把 token 传进去，取消时对 token 调 cancel() 就能立刻终止。"""
+    """把并发跑的 ffmpeg/ffprobe 子进程都注册到 token，cancel() 会遍历全部 kill。
+    支持多进程同时绑定，方便 UI 层用一个 token 统一中断线程池里所有并发任务。"""
 
     def __init__(self):
         self._cancelled = False
-        self._proc = None
+        self._procs = set()
         self._lock = threading.Lock()
 
     def cancel(self):
         with self._lock:
             self._cancelled = True
-            p = self._proc
-        if p is not None:
+            procs = list(self._procs)
+        for p in procs:
             try:
                 p.kill()
             except Exception:
@@ -80,12 +80,12 @@ class CancelToken:
                 except Exception:
                     pass
                 return False
-            self._proc = proc
+            self._procs.add(proc)
             return True
 
-    def _unbind(self):
+    def _unbind(self, proc):
         with self._lock:
-            self._proc = None
+            self._procs.discard(proc)
 
 
 def _run(cmd, *, cancel_token=None, capture_output=True, stdin=None):
@@ -107,7 +107,7 @@ def _run(cmd, *, cancel_token=None, capture_output=True, stdin=None):
         out, err = proc.communicate()
     finally:
         if cancel_token is not None:
-            cancel_token._unbind()
+            cancel_token._unbind(proc)
     if cancel_token is not None and cancel_token.cancelled:
         raise ProcCancelled()
 
@@ -286,7 +286,7 @@ def analyze_basic_stats(ffmpeg, path, channels, cancel_token=None):
     stderr_data = proc.stderr.read()
     proc.wait()
     if cancel_token is not None:
-        cancel_token._unbind()
+        cancel_token._unbind(proc)
         if cancel_token.cancelled:
             raise ProcCancelled()
     if proc.returncode != 0 and count == 0:
@@ -407,10 +407,12 @@ HEADERS = [
     "直流偏移", "是否削波", "备注",
 ]
 
-# UI 表格：精简列，额外带上采样率/位深方便快速核对文件规格
+# UI 表格：精简列，额外带上采样率/位深方便快速核对文件规格。
+# 最后一列 "响度处理" 只在 UI 里出现，用于显示 "处理后 - 处理前" 的响度差；
+# 导出到 Excel 用的是 HEADERS，那边仍然保留原始的 "响度范围(LU)"。
 TABLE_HEADERS = [
     "文件", "时长", "采样率", "位深", "峰值",
-    "瞬时最大", "短期最大", "平均响度", "响度范围",
+    "瞬时最大", "短期最大", "平均响度", "响度处理",
 ]
 
 
@@ -443,12 +445,22 @@ def build_excel_row(i, row):
     ]
 
 
+def _fmt_loudness_delta(delta):
+    """把 "处理后 LUFS - 处理前 LUFS" 格式化成带正负号的 dB 字符串（"+3.15 dB" / "+0.00 dB"）"""
+    if delta is None:
+        return ""
+    if delta == float("-inf") or delta == float("inf"):
+        return ""
+    return f"{float(delta):+.2f} dB"
+
+
 def build_table_row(row):
     """把一条分析结果转换成 UI 表格显示行（列顺序对应 TABLE_HEADERS）。
-    row 可能是三种状态：
+    row 可能是几种状态：
     - {name, dir}：仅列出，未检测 —— 除文件名列外全部留空
     - {name, dir, error}：检测/处理失败 —— 错误信息放在最后一列
-    - {name, dir, data}：已检测/已处理 —— 各指标格式化后填入"""
+    - {name, dir, data}：已检测（响度统计）—— 各指标格式化后填入，末列留空
+    - {name, dir, data, loudness_delta_db}：已处理 —— 末列显示相对源文件的响度差"""
     if row.get("error"):
         return [row["name"], "", "", "", "", "", "", "", row["error"]]
 
@@ -465,15 +477,15 @@ def build_table_row(row):
         fmt_db(d["lufs_m_max"], unit="LUFS"),
         fmt_db(d["lufs_s_max"], unit="LUFS"),
         fmt_db(d["lufs_i"], unit="LUFS"),
-        fmt_db(d["lra"], unit="LU"),
+        _fmt_loudness_delta(row.get("loudness_delta_db")),
     ]
 
 
 # ---------------- 响度标准化（loudnorm 二次通过） ----------------
 
-# loudnorm 内部工作在 192kHz 且线性模式对源 LRA 有上限；用 20 是 ffmpeg 允许的最大值，
-# 让绝大多数音乐能走线性缩放而不是被压缩动态
-LOUDNORM_TARGET_LRA = 20.0
+# loudnorm 第一遍只用来测 input_i / input_tp，这里的 target LRA 不影响 input_* 结果，
+# 传 ffmpeg 允许的上限只是避免测量步骤报警
+LOUDNORM_MEASURE_LRA = 20.0
 
 
 def _clamp_bitrate(bit_rate, lo, hi, default):
@@ -559,10 +571,17 @@ FORMAT_LOSSLESS = {".wav", ".flac"}
 FORMAT_LOSSY = {".mp3", ".m4a"}
 
 
-def _codec_args_for_format(ext, bit_depth=None, bit_rate=None):
+def _codec_args_for_format(ext, src_meta=None, bit_depth=None, bit_rate=None):
     """给定输出扩展名 + 位深/码率（按格式类型二选一），返回 ffmpeg codec 参数。
-    比 _pick_output_codec 更明确 —— 前者是"跟随源"，这里是"用户指定"。"""
+    bit_depth / bit_rate 为 None 时表示"与源相同"，从 src_meta 取；src_meta 也
+    没有对应值 or 值超出编码器合理范围时（比如 WAV 源转 mp3，WAV 的"码率"其实
+    是未压缩比特率）clamp 到编码器合法上限后再用。"""
     ext = ext.lower()
+    src_meta = src_meta or {}
+    if bit_depth is None:
+        bit_depth = src_meta.get("bit_depth")
+    if bit_rate is None:
+        bit_rate = src_meta.get("bit_rate")
     if ext == ".wav":
         if bit_depth == 24:
             return ["-c:a", "pcm_s24le"]
@@ -572,26 +591,36 @@ def _codec_args_for_format(ext, bit_depth=None, bit_rate=None):
     if ext == ".flac":
         return ["-c:a", "flac", "-sample_fmt", "s32" if (bit_depth and bit_depth >= 24) else "s16"]
     if ext == ".mp3":
-        br = int(bit_rate or 192_000)
-        return ["-c:a", "libmp3lame", "-b:a", str(br)]
+        return ["-c:a", "libmp3lame", "-b:a", str(_clamp_bitrate(bit_rate, 32_000, 320_000, 192_000))]
     if ext in (".m4a", ".aac"):
-        br = int(bit_rate or 192_000)
-        return ["-c:a", "aac", "-b:a", str(br)]
+        return ["-c:a", "aac", "-b:a", str(_clamp_bitrate(bit_rate, 32_000, 512_000, 192_000))]
     return []
 
 
+def _same_file_path(a, b) -> bool:
+    """判断两条路径是否指向同一个文件。
+    Windows 下 `Path.resolve() ==` 会漏掉大小写差异、8.3 短名、盘符大小写等情况；
+    这里统一到 abspath + normcase 再比较，Linux/macOS 上退化为 abspath 严格比较。"""
+    try:
+        pa = os.path.realpath(str(a))
+        pb = os.path.realpath(str(b))
+    except OSError:
+        pa, pb = str(a), str(b)
+    return os.path.normcase(os.path.abspath(pa)) == os.path.normcase(os.path.abspath(pb))
+
+
 def _resolve_output_path(src_path, dst_dir, out_ext):
-    """决定输出到 dst_dir 里的哪个文件名；扩展名不同时无需担心冲突，同扩展名+同目录 = 与源重名时加后缀避让"""
+    """决定输出到 dst_dir 里的哪个文件名。任何会覆盖源文件的情况都改名避让。"""
     src = Path(src_path)
     dst_dir = Path(dst_dir)
     dst = dst_dir / f"{src.stem}{out_ext}"
-    # 如果输出会覆盖源文件本身（同扩展名 + 用户把输出目录选成了源目录），换个后缀避让
-    try:
-        same_as_src = dst.resolve() == src.resolve()
-    except OSError:
-        same_as_src = False
-    if same_as_src:
+    if _same_file_path(dst, src):
         dst = dst_dir / f"{src.stem}_normalized{out_ext}"
+        # 极端情况下仍撞名（不太可能），最后套一层数字后缀兜底
+        i = 1
+        while _same_file_path(dst, src):
+            dst = dst_dir / f"{src.stem}_normalized_{i}{out_ext}"
+            i += 1
     return dst
 
 
@@ -609,9 +638,23 @@ def process_file(
     - format_config is not None 时按 dict 指定的格式/采样率/位深或码率/声道 重新封装编码
     - 两者都为假：直接 copy 到目标目录
     - cancel_token：允许 UI 立即中断当前正在跑的 ffmpeg
-    返回 (dst_path: Path, loudnorm_applied: bool, converted: bool)"""
+    返回 (dst_path: Path, loudnorm_applied: bool, converted: bool, applied_gain_db: float)
+    applied_gain_db 是 volume 滤镜实际应用的 dB 增益（跳过 loudnorm/静音素材/纯复制都返回 0.0）"""
     src = Path(src_path)
     src_meta = probe_file(ffprobe, src, cancel_token=cancel_token)
+
+    # 与源相同 + 源是有损：位深对有损编码无意义，直接忽略用户的位深选择，
+    # 让"全为 None → 直接拷贝"的快速路径能命中，避免无谓的有损→有损转码
+    if (
+        format_config
+        and format_config.get("ext") is None
+        and (src_meta.get("codec_name") or "").lower() in LOSSY_CODECS
+    ):
+        format_config = {**format_config, "bit_depth": None}
+
+    # 全部下拉都是"与源相同" = 用户没改任何值 → 相当于没启用格式转换
+    if format_config and all(v is None for v in format_config.values()):
+        format_config = None
 
     # 决定输出扩展名与目标路径
     out_ext = (format_config or {}).get("ext") or src.suffix.lower()
@@ -638,15 +681,17 @@ def process_file(
 
     # 都不做：直接复制
     if not need_loudnorm and not format_config:
+        if _same_file_path(dst, src):
+            raise RuntimeError(f"内部错误：输出路径 {dst} 与源文件相同，已中止以防覆盖源")
         shutil.copy2(src, dst)
-        return dst, False, False
+        return dst, False, False, 0.0
 
-    # 格式配置：优先用用户指定值，缺失时保留源参数
+    # 格式配置：用户显式指定的值覆盖源；下拉选"与源相同"(None) 时回落到源参数
     if format_config:
         out_sr = format_config.get("sample_rate") or src_meta.get("sample_rate")
         out_ch = format_config.get("channels") or src_meta.get("channels")
         codec_args = _codec_args_for_format(
-            out_ext,
+            out_ext, src_meta,
             bit_depth=format_config.get("bit_depth"),
             bit_rate=format_config.get("bit_rate"),
         )
@@ -655,42 +700,58 @@ def process_file(
         out_ch = src_meta.get("channels")
         codec_args = _pick_output_codec(out_ext, src_meta)
 
-    # loudnorm filter chain：两遍法（测量 + 应用），linear=true 保留动态。
-    # 后面接 alimiter 做真峰保护：即便 loudnorm 因源 LRA > LOUDNORM_TARGET_LRA
-    # 静默回退到 dynamic，或者 linear 结果的 inter-sample 峰值略超上限，
-    # alimiter 也能兜底把峰压回目标 TP，不再放大动态压缩的量。
+    # 参考 Adobe Audition "响度匹配" 的思路：
+    # 1) 用 loudnorm 第一遍测量得到 input_i / input_tp（BS.1770 标准，与 Audition 一致）
+    # 2) 直接算恒定 dB 增益 gain = target_i - input_i，用 `volume` 整体等比缩放，
+    #    波形形状 100% 保留，动态范围完全不变
+    # 3) 只有当放大后的 True Peak 会顶爆 target_TP 时，才在末端串一个 alimiter 兜底；
+    #    alimiter 只在瞬时峰值触及阈值时才启动，其余部分完全透传，不做动态压缩，
+    #    相当于 Audition "Use Limiting" 选项
     af = None
+    applied_gain_db = 0.0
     if need_loudnorm:
         stats = _measure_loudnorm(
-            ffmpeg, src, target_i, target_tp, LOUDNORM_TARGET_LRA,
+            ffmpeg, src, target_i, target_tp, LOUDNORM_MEASURE_LRA,
             cancel_token=cancel_token,
         )
         try:
             input_i = float(stats.get("input_i", "-inf"))
         except (TypeError, ValueError):
             input_i = float("-inf")
-        # 素材几乎无声：跳过 loudnorm 步骤，但仍做格式转换（如果启用）
+        try:
+            input_tp = float(stats.get("input_tp", "-inf"))
+        except (TypeError, ValueError):
+            input_tp = float("-inf")
+
+        # 素材几乎无声：跳过响度匹配，但仍做格式转换（如果启用）
         if input_i <= -70.0 or input_i == float("-inf"):
             need_loudnorm = False
         else:
-            # alimiter 只做峰值兜底：level=disabled/asc=off，避免自动电平把响度顶上去
-            tp_linear = 10 ** (target_tp / 20.0)
-            af = (
-                f"loudnorm=I={target_i}:TP={target_tp}:LRA={LOUDNORM_TARGET_LRA}"
-                f":measured_I={stats.get('input_i', 0)}"
-                f":measured_TP={stats.get('input_tp', 0)}"
-                f":measured_LRA={stats.get('input_lra', 0)}"
-                f":measured_thresh={stats.get('input_thresh', -70)}"
-                f":offset={stats.get('target_offset', 0)}"
-                f":linear=true"
-                f":print_format=summary,"
-                f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0"
+            gain_db = target_i - input_i
+            applied_gain_db = gain_db
+            predicted_tp = (
+                input_tp + gain_db if input_tp != float("-inf") else float("-inf")
             )
+            if predicted_tp <= target_tp:
+                # 增益后不会超 TP，纯线性等比缩放，动态完全保留
+                af = f"volume={gain_db:.6f}dB"
+            else:
+                # 会顶爆 TP，串一个 True Peak Limiter 兜底
+                tp_linear = 10 ** (target_tp / 20.0)
+                af = (
+                    f"volume={gain_db:.6f}dB,"
+                    f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0"
+                )
 
     # 只需要 loudnorm 被跳过 + 也没有格式转换 = 直接 copy
     if not need_loudnorm and not format_config:
+        if _same_file_path(dst, src):
+            raise RuntimeError(f"内部错误：输出路径 {dst} 与源文件相同，已中止以防覆盖源")
         shutil.copy2(src, dst)
-        return dst, False, False
+        return dst, False, False, 0.0
+
+    if _same_file_path(dst, src):
+        raise RuntimeError(f"内部错误：输出路径 {dst} 与源文件相同，已中止以防覆盖源")
 
     cmd = [ffmpeg, "-y", "-hide_banner", "-v", "error", "-i", str(src)]
     if af:
@@ -722,7 +783,7 @@ def process_file(
             f"处理失败: {result.stderr.decode(errors='ignore')[:300]}"
         )
 
-    return dst, bool(af), bool(format_config)
+    return dst, bool(af), bool(format_config), applied_gain_db
 
 
 def write_excel(rows, out_path):

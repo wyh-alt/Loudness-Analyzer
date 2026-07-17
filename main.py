@@ -6,10 +6,21 @@
 
 import os
 import sys
+import time
 import ctypes
 import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+
+def compute_concurrency():
+    """基于 CPU 核心数估算合理的并发处理数。
+    ffmpeg 内部本身可能是多线程，因此不使用全部核心，同时给系统/UI 留余量；
+    上限 8 是经验值，避免大量并发 ffmpeg 争抢磁盘 I/O 反而变慢。"""
+    n = os.cpu_count() or 1
+    return max(1, min(n // 2, 8))
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRect
 from PyQt6.QtGui import (
@@ -20,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QProgressBar, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QStyledItemDelegate, QStyle, QSplashScreen, QCheckBox, QDoubleSpinBox,
+    QStyledItemDelegate, QStyle, QSplashScreen, QDoubleSpinBox,
     QComboBox,
 )
 
@@ -231,26 +242,6 @@ QMessageBox {{
     background: {c['surface']};
     color: {c['text']};
 }}
-QCheckBox#normalizeCheck {{
-    color: {c['text']};
-    spacing: 6px;
-    font-size: 13px;
-}}
-QCheckBox#normalizeCheck::indicator {{
-    width: 14px;
-    height: 14px;
-    border: 1px solid {c['border']};
-    border-radius: 3px;
-    background: {c['surface']};
-}}
-QCheckBox#normalizeCheck::indicator:hover {{
-    border-color: {c['accent']};
-}}
-QCheckBox#normalizeCheck::indicator:checked {{
-    background: {c['accent']};
-    border-color: {c['accent']};
-    image: url({_check_svg('#ffffff')});
-}}
 QWidget#normParams QLabel {{
     color: {c['text_secondary']};
     font-size: 12px;
@@ -402,21 +393,22 @@ class DropLineEdit(QLineEdit):
 class SelectionBorderDelegate(QStyledItemDelegate):
     """Excel 风格：选中的单元格四周画一条稍粗的强调色边框。
     另外支持"当前处理行"整行高亮 —— 在 super().paint() 之前先铺一层半透明底色，
-    这样样式表里 ::item 的 alpha 覆盖问题不会影响这里的绘制。"""
+    这样样式表里 ::item 的 alpha 覆盖问题不会影响这里的绘制。
+    并发处理时可能有多行同时在跑，因此内部维护一个"活动行集合"，全部高亮。"""
 
     def __init__(self, color, parent=None):
         super().__init__(parent)
         self._color = QColor(color)
-        self._current_row = -1
+        self._active_rows = set()
 
     def set_color(self, color):
         self._color = QColor(color)
 
-    def set_current_row(self, row):
-        self._current_row = row
+    def set_active_rows(self, rows):
+        self._active_rows = set(rows) if rows else set()
 
     def paint(self, painter, option, index):
-        if self._current_row == index.row() and self._current_row >= 0:
+        if index.row() in self._active_rows:
             painter.save()
             bg = QColor(self._color)
             bg.setAlpha(110)
@@ -544,20 +536,26 @@ class ResultsTable(QTableWidget):
             self._suppress_fit = False
 
 
+_UI_HIGHLIGHT_MIN_MS = 30  # 结果已就绪时给主线程绘制一帧高亮的最短等待
+
+
 class AnalyzeWorker(QThread):
-    """给已列出的 rows 逐首跑 analyze_file，把响度指标回填到 row["data"]。
-    取消时会立刻 kill 正在跑的 ffmpeg（通过 CancelToken），不等文件跑完。"""
+    """给已列出的 rows 并发跑 analyze_file，把响度指标回填到 row["data"]。
+    工作层是并发的，但 UI 信号严格按行号顺序发送 —— 用户视觉上仍然是一首接一首。
+    取消时立刻 kill 所有正在跑的 ffmpeg（通过共享 CancelToken）。"""
     progress = pyqtSignal(int, int, str)
+    row_started = pyqtSignal(int)
     row_updated = pyqtSignal(int, dict)
     finished_ok = pyqtSignal(int, int)  # total, error_count
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, rows, ffmpeg, ffprobe):
+    def __init__(self, rows, ffmpeg, ffprobe, workers=1):
         super().__init__()
         self.rows = rows
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
+        self.workers = max(1, int(workers))
         self._token = CancelToken()
 
     def cancel(self):
@@ -566,29 +564,60 @@ class AnalyzeWorker(QThread):
     def run(self):
         total = len(self.rows)
         errors = 0
-        for idx, row in enumerate(self.rows):
-            if self._token.cancelled:
-                self.cancelled.emit()
-                return
+        results = {}
+        cond = threading.Condition()
+
+        def do_work(idx, row):
             path = Path(row["dir"]) / row["name"]
-            self.progress.emit(idx + 1, total, str(path))
             try:
                 data = analyze_file(self.ffmpeg, self.ffprobe, path, cancel_token=self._token)
-                new_row = {"name": path.name, "dir": str(path.parent), "data": data}
+                res = ({"name": path.name, "dir": str(path.parent), "data": data}, False)
             except ProcCancelled:
-                self.cancelled.emit()
-                return
+                res = (None, True)
             except Exception as e:
-                errors += 1
-                new_row = {"name": path.name, "dir": str(path.parent), "error": str(e)}
-            self.row_updated.emit(idx, new_row)
+                res = ({"name": path.name, "dir": str(path.parent), "error": str(e)}, False)
+            with cond:
+                results[idx] = res
+                cond.notify_all()
+
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            for i, r in enumerate(self.rows):
+                ex.submit(do_work, i, r)
+
+            # UI 层严格按 idx 顺序发信号，未就绪就阻塞等，让用户视觉上仍是一首接一首
+            for idx in range(total):
+                if self._token.cancelled:
+                    self.cancelled.emit()
+                    return
+                self.row_started.emit(idx)
+                with cond:
+                    already_ready = idx in results
+                    while idx not in results and not self._token.cancelled:
+                        cond.wait(timeout=0.1)
+                    if self._token.cancelled:
+                        self.cancelled.emit()
+                        return
+                    new_row, was_cancelled = results.pop(idx)
+                if was_cancelled:
+                    self.cancelled.emit()
+                    return
+                # 若结果已就绪就没有天然的等待时长，给主线程一帧的时间画出高亮再刷值
+                if already_ready:
+                    time.sleep(_UI_HIGHLIGHT_MIN_MS / 1000)
+                if "error" in new_row:
+                    errors += 1
+                path_str = str(Path(new_row["dir"]) / new_row["name"])
+                self.progress.emit(idx + 1, total, path_str)
+                self.row_updated.emit(idx, new_row)
+
         self.finished_ok.emit(total, errors)
 
 
 class ProcessWorker(QThread):
-    """逐首另存处理：可选响度标准化 + 可选格式转换。
+    """并发另存处理：响度标准化 + 格式转换。
     源文件不会被改动，处理产物写到 out_dir，处理后重扫产物拿到新指标回填表格。"""
     progress = pyqtSignal(int, int, str)
+    row_started = pyqtSignal(int)
     row_updated = pyqtSignal(int, dict)
     # out_dir, total, processed, skipped, errors
     finished_ok = pyqtSignal(str, int, int, int, int)
@@ -598,7 +627,7 @@ class ProcessWorker(QThread):
     def __init__(
         self, rows, out_dir, ffmpeg, ffprobe,
         *, normalize_loudness, target_i, target_tp, tolerance_lu,
-        format_config,
+        format_config, workers=1,
     ):
         super().__init__()
         self.rows = rows
@@ -610,6 +639,7 @@ class ProcessWorker(QThread):
         self.target_tp = target_tp
         self.tolerance_lu = tolerance_lu
         self.format_config = format_config
+        self.workers = max(1, int(workers))
         self._token = CancelToken()
 
     def cancel(self):
@@ -618,23 +648,18 @@ class ProcessWorker(QThread):
     def run(self):
         total = len(self.rows)
         processed = 0
-        skipped = 0  # 符合要求、直接原字节复制到输出目录的
+        skipped = 0
         errors = 0
+        results = {}
+        cond = threading.Condition()
 
-        for idx, row in enumerate(self.rows):
-            if self._token.cancelled:
-                self.cancelled.emit()
-                return
-
+        def do_work(idx, row):
             src_path = Path(row["dir"]) / row["name"]
-            self.progress.emit(idx + 1, total, str(src_path))
-
             data = row.get("data") or {}
             measured_lufs = data.get("lufs_i")
             measured_tp = data.get("true_peak_db")
-
             try:
-                dst, loudnorm_applied, converted = process_file(
+                dst, loudnorm_applied, converted, applied_gain_db = process_file(
                     self.ffmpeg, self.ffprobe, src_path, self.out_dir,
                     normalize_loudness=self.normalize_loudness,
                     target_i=self.target_i,
@@ -645,26 +670,65 @@ class ProcessWorker(QThread):
                     format_config=self.format_config,
                     cancel_token=self._token,
                 )
-                if loudnorm_applied or converted:
-                    processed += 1
-                else:
-                    # loudnorm 被容差跳过 + 无格式转换 = 直接 copy，视为"符合要求无需处理"
-                    skipped += 1
-                # 处理后的文件重新走一遍分析，把新指标回填表格
+                was_processed = bool(loudnorm_applied or converted)
+                # loudnorm 被容差跳过 + 无格式转换 = 直接 copy，视为"符合要求无需处理"
+                was_skipped = not was_processed
                 new_data = analyze_file(self.ffmpeg, self.ffprobe, dst, cancel_token=self._token)
                 new_row = {
-                    "name": dst.name,
-                    "dir": str(dst.parent),
+                    "name": dst.name, "dir": str(dst.parent),
                     "data": new_data,
+                    # 直接用 volume 滤镜实际施加的 dB 增益作为"响度处理"值，单位精确
+                    "loudness_delta_db": applied_gain_db,
                 }
+                res = (new_row, False, was_processed, was_skipped, False)
             except ProcCancelled:
-                self.cancelled.emit()
-                return
+                res = (None, True, False, False, False)
             except Exception as e:
-                errors += 1
-                new_row = {"name": src_path.name, "dir": str(src_path.parent), "error": str(e)}
+                import traceback
+                tb_lines = traceback.format_exc().splitlines()
+                # 抓 traceback 里最后一个 File 行，指出真正抛异常的位置，方便定位
+                loc = next(
+                    (ln.strip() for ln in reversed(tb_lines) if ln.strip().startswith("File ")),
+                    "",
+                )
+                err_msg = f"{e}  [{loc}]" if loc else str(e)
+                new_row = {"name": src_path.name, "dir": str(src_path.parent), "error": err_msg}
+                res = (new_row, False, False, False, True)
+            with cond:
+                results[idx] = res
+                cond.notify_all()
 
-            self.row_updated.emit(idx, new_row)
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            for i, r in enumerate(self.rows):
+                ex.submit(do_work, i, r)
+
+            for idx in range(total):
+                if self._token.cancelled:
+                    self.cancelled.emit()
+                    return
+                self.row_started.emit(idx)
+                with cond:
+                    already_ready = idx in results
+                    while idx not in results and not self._token.cancelled:
+                        cond.wait(timeout=0.1)
+                    if self._token.cancelled:
+                        self.cancelled.emit()
+                        return
+                    new_row, was_cancelled, was_processed, was_skipped, was_error = results.pop(idx)
+                if was_cancelled:
+                    self.cancelled.emit()
+                    return
+                if already_ready:
+                    time.sleep(_UI_HIGHLIGHT_MIN_MS / 1000)
+                if was_processed:
+                    processed += 1
+                elif was_skipped:
+                    skipped += 1
+                if was_error:
+                    errors += 1
+                path_str = str(Path(new_row["dir"]) / new_row["name"])
+                self.progress.emit(idx + 1, total, path_str)
+                self.row_updated.emit(idx, new_row)
 
         self.finished_ok.emit(str(self.out_dir), total, processed, skipped, errors)
 
@@ -683,10 +747,11 @@ class MainWindow(QWidget):
         self.ffprobe = find_tool("ffprobe")
         self.worker = None
         self._accent_color = _LIGHT["accent"]  # 由 set_theme() 跟随主题更新，用于选中单元格边框
+        self._concurrency = compute_concurrency()
 
         # 表格数据：每行是 {name, dir} / {name, dir, data} / {name, dir, error}
         self._loaded_rows = []
-        self._highlighted_row = -1  # 处理中高亮的行索引
+        self._active_rows = set()  # 并发处理中当前正在跑的行索引集合
 
         layout = QVBoxLayout(self)
         # 底部边距缩小，让按钮行更贴近窗口下沿
@@ -701,9 +766,15 @@ class MainWindow(QWidget):
         path_row.addWidget(self.browse_btn)
         layout.addLayout(path_row)
 
+        hint_row = QHBoxLayout()
         hint = QLabel("支持 WAV / MP3 / FLAC / M4A 等常见音频格式", self)
         hint.setObjectName("hintLabel")
-        layout.addWidget(hint)
+        self.concurrency_label = QLabel(f"并发处理数: {self._concurrency}", self)
+        self.concurrency_label.setObjectName("hintLabel")
+        hint_row.addWidget(hint)
+        hint_row.addStretch(1)
+        hint_row.addWidget(self.concurrency_label)
+        layout.addLayout(hint_row)
 
         self.table = ResultsTable(0, len(TABLE_HEADERS), self)
         self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
@@ -743,14 +814,9 @@ class MainWindow(QWidget):
         SPIN_W = 100  # 数值+单位（"-12.0 LUFS"/"-1.0 dBTP"）+ 右侧上下按钮全部完整可见
         COMBO_W = 100
 
-        # 响度标准化行：复选框 + 目标响度 / 容差 / 最高实际峰值
+        # 响度标准化行：目标响度 / 容差 / 最高实际峰值（始终启用）
         norm_row = QHBoxLayout()
         norm_row.setSpacing(16)
-
-        self.normalize_cb = QCheckBox("响度标准化", self)
-        self.normalize_cb.setObjectName("normalizeCheck")
-        self.normalize_cb.setChecked(True)
-        norm_row.addWidget(self.normalize_cb)
 
         self.norm_params_widget = QWidget(self)
         self.norm_params_widget.setObjectName("normParams")
@@ -796,19 +862,13 @@ class MainWindow(QWidget):
         self.max_tp_spin.setFixedWidth(SPIN_W)
         params_row.addWidget(self.max_tp_spin)
 
-        self.norm_params_widget.setEnabled(self.normalize_cb.isChecked())
         norm_row.addWidget(self.norm_params_widget)
         norm_row.addStretch(1)
         layout.addLayout(norm_row)
 
-        # 格式标准化行：复选框 + 音频格式 / 采样率 / 位深(仅无损) 或 码率(仅有损) / 声道
+        # 格式标准化行：音频格式 / 采样率 / 位深(仅无损) 或 码率(仅有损) / 声道（始终启用）
         fmt_row = QHBoxLayout()
         fmt_row.setSpacing(16)
-
-        self.format_cb = QCheckBox("格式标准化", self)
-        self.format_cb.setObjectName("normalizeCheck")
-        self.format_cb.setChecked(False)
-        fmt_row.addWidget(self.format_cb)
 
         self.fmt_params_widget = QWidget(self)
         self.fmt_params_widget.setObjectName("normParams")
@@ -816,9 +876,11 @@ class MainWindow(QWidget):
         fmt_params.setContentsMargins(0, 0, 0, 0)
         fmt_params.setSpacing(6)
 
+        # "与源相同"作为每个下拉的默认项，data=None 表示不覆盖源参数
         fmt_params.addWidget(QLabel("音频格式:", self))
         self.format_combo = QComboBox(self)
         self.format_combo.setObjectName("normCombo")
+        self.format_combo.addItem("与源相同", None)
         for label, ext in [(".wav", ".wav"), (".mp3", ".mp3"), (".m4a", ".m4a"), (".flac", ".flac")]:
             self.format_combo.addItem(label, ext)
         self.format_combo.setFixedWidth(COMBO_W)
@@ -828,27 +890,30 @@ class MainWindow(QWidget):
         fmt_params.addWidget(QLabel("采样率:", self))
         self.sr_combo = QComboBox(self)
         self.sr_combo.setObjectName("normCombo")
+        self.sr_combo.addItem("与源相同", None)
         for label, val in [("44100 Hz", 44100), ("48000 Hz", 48000)]:
             self.sr_combo.addItem(label, val)
         self.sr_combo.setFixedWidth(COMBO_W)
         fmt_params.addWidget(self.sr_combo)
 
-        # 位深（仅无损时显示）
+        # 位深：无损格式或"与源相同"时显示；有损（mp3/m4a）时隐藏
         fmt_params.addSpacing(16)
         self.bit_depth_label = QLabel("位深度:", self)
         fmt_params.addWidget(self.bit_depth_label)
         self.bit_depth_combo = QComboBox(self)
         self.bit_depth_combo.setObjectName("normCombo")
+        self.bit_depth_combo.addItem("与源相同", None)
         for label, val in [("16 Bit", 16), ("24 Bit", 24), ("32 Bit", 32)]:
             self.bit_depth_combo.addItem(label, val)
         self.bit_depth_combo.setFixedWidth(COMBO_W)
         fmt_params.addWidget(self.bit_depth_combo)
 
-        # 码率（仅有损时显示）
+        # 比特率：有损格式或"与源相同"时显示；无损（wav/flac）时隐藏
         self.bit_rate_label = QLabel("比特率:", self)
         fmt_params.addWidget(self.bit_rate_label)
         self.bit_rate_combo = QComboBox(self)
         self.bit_rate_combo.setObjectName("normCombo")
+        self.bit_rate_combo.addItem("与源相同", None)
         for label, val in [("320 kbps", 320_000), ("256 kbps", 256_000),
                            ("192 kbps", 192_000), ("128 kbps", 128_000), ("64 kbps", 64_000)]:
             self.bit_rate_combo.addItem(label, val)
@@ -859,12 +924,12 @@ class MainWindow(QWidget):
         fmt_params.addWidget(QLabel("声道:", self))
         self.channels_combo = QComboBox(self)
         self.channels_combo.setObjectName("normCombo")
+        self.channels_combo.addItem("与源相同", None)
         for label, val in [("立体声", 2), ("单声道", 1)]:
             self.channels_combo.addItem(label, val)
         self.channels_combo.setFixedWidth(COMBO_W)
         fmt_params.addWidget(self.channels_combo)
 
-        self.fmt_params_widget.setEnabled(self.format_cb.isChecked())
         fmt_row.addWidget(self.fmt_params_widget)
         fmt_row.addStretch(1)
         layout.addLayout(fmt_row)
@@ -904,8 +969,6 @@ class MainWindow(QWidget):
         self.measure_btn.clicked.connect(self.on_measure)
         self.path_edit.dropped.connect(self.on_path_dropped)
         self.table.files_dropped.connect(self.on_table_dropped)
-        self.normalize_cb.toggled.connect(self.on_normalize_toggled)
-        self.format_cb.toggled.connect(self.on_format_toggled)
         self.format_combo.currentIndexChanged.connect(self._sync_format_specific_visibility)
 
         # 初始应用一次"位深/码率随格式切换"的联动
@@ -931,36 +994,34 @@ class MainWindow(QWidget):
 
     # ---------------- 参数区交互 ----------------
 
-    def on_normalize_toggled(self, checked):
-        self.norm_params_widget.setEnabled(checked)
-
-    def on_format_toggled(self, checked):
-        self.fmt_params_widget.setEnabled(checked)
-
     def _sync_format_specific_visibility(self, *_):
-        """格式切换：无损（wav/flac）显位深、隐码率；有损（mp3/m4a）反之"""
+        """格式切换的联动：
+        - 与源相同：隐藏比特率，保留位深度；实际是否使用位深度由 core 根据源
+          文件的有损/无损决定（有损源忽略位深、保留原始码率；无损源应用位深）
+        - 无损（wav/flac）：只显位深
+        - 有损（mp3/m4a）：只显比特率"""
         ext = self.format_combo.currentData()
-        is_lossless = ext in FORMAT_LOSSLESS
-        self.bit_depth_label.setVisible(is_lossless)
-        self.bit_depth_combo.setVisible(is_lossless)
-        self.bit_rate_label.setVisible(not is_lossless)
-        self.bit_rate_combo.setVisible(not is_lossless)
+        if ext is None:  # 与源相同
+            show_bd = True
+            show_br = False
+        else:
+            show_bd = ext in FORMAT_LOSSLESS
+            show_br = not show_bd
+        self.bit_depth_label.setVisible(show_bd)
+        self.bit_depth_combo.setVisible(show_bd)
+        self.bit_rate_label.setVisible(show_br)
+        self.bit_rate_combo.setVisible(show_br)
 
     def _current_format_config(self):
-        """把格式参数装成 process_file 用的 dict；未勾选时返回 None"""
-        if not self.format_cb.isChecked():
-            return None
-        ext = self.format_combo.currentData()
-        cfg = {
-            "ext": ext,
+        """把格式参数装成 process_file 用的 dict。任一字段是 None 表示"与源相同"，
+        core.process_file 会回落到源参数。"""
+        return {
+            "ext": self.format_combo.currentData(),
             "sample_rate": self.sr_combo.currentData(),
             "channels": self.channels_combo.currentData(),
+            "bit_depth": self.bit_depth_combo.currentData(),
+            "bit_rate": self.bit_rate_combo.currentData(),
         }
-        if ext in FORMAT_LOSSLESS:
-            cfg["bit_depth"] = self.bit_depth_combo.currentData()
-        else:
-            cfg["bit_rate"] = self.bit_rate_combo.currentData()
-        return cfg
 
     # ---------------- 拖入 / 响度统计 / 开始处理 ----------------
 
@@ -1001,6 +1062,16 @@ class MainWindow(QWidget):
         self.measure_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
         self.start_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
 
+    def _clear_rows_data(self):
+        """清空当前所有行的数据/错误状态，保留文件名与目录。
+        UI 上除文件名列外全部留空，等 worker 逐首回填。"""
+        for row in self._loaded_rows:
+            row.pop("data", None)
+            row.pop("error", None)
+        for r, row in enumerate(self._loaded_rows):
+            if r < self.table.rowCount():
+                self._fill_row(r, build_table_row(row))
+
     def on_measure(self):
         """响度统计：对当前 loaded_rows 逐首跑 analyze_file"""
         if self.worker and self.worker.isRunning():
@@ -1008,14 +1079,19 @@ class MainWindow(QWidget):
         if not self._loaded_rows:
             QMessageBox.warning(self, "提示", "请先拖入音频。")
             return
+        self._clear_rows_data()
         self.progress_bar.setValue(0)
         self.measure_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.status_label.setText("准备检测响度...")
-        self.worker = AnalyzeWorker(list(self._loaded_rows), self.ffmpeg, self.ffprobe)
+        self.worker = AnalyzeWorker(
+            list(self._loaded_rows), self.ffmpeg, self.ffprobe,
+            workers=self._concurrency,
+        )
         self.worker.progress.connect(self.on_progress)
+        self.worker.row_started.connect(self.on_row_started)
         self.worker.row_updated.connect(self.on_row_updated)
         self.worker.finished_ok.connect(self.on_measure_finished)
         self.worker.failed.connect(self.on_failed)
@@ -1029,14 +1105,8 @@ class MainWindow(QWidget):
         if not self._loaded_rows:
             QMessageBox.warning(self, "提示", "请先拖入音频。")
             return
-        do_loudness = self.normalize_cb.isChecked()
+        do_loudness = True
         format_cfg = self._current_format_config()
-        if not do_loudness and not format_cfg:
-            QMessageBox.information(
-                self, "提示",
-                "响度标准化和格式标准化都未启用，音频无需处理。",
-            )
-            return
 
         # 弹出输出目录选择
         first = self.path_edit.current_paths()[0] if self.path_edit.current_paths() else self._loaded_rows[0]["dir"]
@@ -1047,6 +1117,7 @@ class MainWindow(QWidget):
         if not out_dir:
             return
 
+        self._clear_rows_data()
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
         self.measure_btn.setEnabled(False)
@@ -1060,8 +1131,10 @@ class MainWindow(QWidget):
             target_tp=self.max_tp_spin.value(),
             tolerance_lu=self.tolerance_spin.value(),
             format_config=format_cfg,
+            workers=self._concurrency,
         )
         self.worker.progress.connect(self.on_progress)
+        self.worker.row_started.connect(self.on_row_started)
         self.worker.row_updated.connect(self.on_row_updated)
         self.worker.finished_ok.connect(self.on_process_finished)
         self.worker.failed.connect(self.on_failed)
@@ -1088,23 +1161,22 @@ class MainWindow(QWidget):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(idx)
         self.status_label.setText(f"正在处理 ({idx}/{total})：{name}")
-        # 高亮当前行 + 滚动到可视区，便于用户直观追踪进度
-        self._highlight_row(idx - 1)
 
-    def _highlight_row(self, row_idx):
-        """通过 delegate 直接绘制整行高亮 + 滚动到该行。row_idx=-1 清除高亮。
-        走 delegate.paint() 是因为 QSS 里 ::item 会吞掉 setBackground 的 alpha。"""
-        if row_idx is None or row_idx < 0 or row_idx >= self.table.rowCount():
-            self._selection_delegate.set_current_row(-1)
-            self._highlighted_row = -1
-            self.table.viewport().update()
+    def on_row_started(self, idx):
+        """Worker 层可能在并发跑，但 UI 是严格顺序推进的：同一时刻只高亮一行。"""
+        if idx < 0 or idx >= self.table.rowCount():
             return
-        self._selection_delegate.set_current_row(row_idx)
-        self._highlighted_row = row_idx
+        self._active_rows = {idx}
+        self._selection_delegate.set_active_rows(self._active_rows)
         self.table.viewport().update()
-        anchor = self.table.item(row_idx, 0)
+        anchor = self.table.item(idx, 0)
         if anchor is not None:
             self.table.scrollToItem(anchor, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _clear_highlights(self):
+        self._active_rows.clear()
+        self._selection_delegate.set_active_rows(set())
+        self.table.viewport().update()
 
     def on_copy_shortcut(self):
         """焦点在路径输入框时复制路径文本；否则复制表格里已选中的单元格。
@@ -1142,6 +1214,11 @@ class MainWindow(QWidget):
             self._loaded_rows[idx] = row
         if 0 <= idx < self.table.rowCount():
             self._fill_row(idx, build_table_row(row))
+        # 该行处理结束，从高亮集合摘掉
+        if idx in self._active_rows:
+            self._active_rows.discard(idx)
+            self._selection_delegate.set_active_rows(self._active_rows)
+            self.table.viewport().update()
 
     def _reset_buttons(self):
         has_rows = bool(self._loaded_rows)
@@ -1152,8 +1229,8 @@ class MainWindow(QWidget):
         self.measure_btn.setEnabled(has_rows and deps_ok)
         self.cancel_btn.setEnabled(False)
         self.export_btn.setEnabled(has_data)
-        # 一轮结束，清除进度高亮
-        self._highlight_row(-1)
+        # 一轮结束，清除全部进度高亮
+        self._clear_highlights()
 
     def on_measure_finished(self, total, error_count):
         self._reset_buttons()
