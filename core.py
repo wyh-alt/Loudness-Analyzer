@@ -398,31 +398,33 @@ def scan_folder(root_folders):
     return sorted(set(files))
 
 
-# Excel 导出：完整明细列，单位换行到第二行显示，避免窄列被截断
+# Excel 导出：完整明细列，单位换行到第二行显示，避免窄列被截断。
+# 真实峰值 / 平均响度 / 是否削波 三列被有意放到最右，表头会加橙黄底突出显示（在 write_excel 里处理）。
 HEADERS = [
     "序号", "文件名", "采样率\n(Hz)", "位深", "声道数", "时长",
     "峰值\n(dBFS)", "左声道RMS\n(dBFS)", "右声道RMS\n(dBFS)",
-    "平均响度\n(LUFS)", "短期最大响度\n(LUFS)", "瞬时最大响度\n(LUFS)",
-    "响度范围\n(LU)", "真实峰值\n(dBTP)",
-    "直流偏移", "是否削波", "备注",
+    "短期最大响度\n(LUFS)", "瞬时最大响度\n(LUFS)",
+    "响度范围\n(LU)", "直流偏移",
+    "真实峰值\n(dBTP)", "平均响度\n(LUFS)", "是否削波",
 ]
+
+# HEADERS 中被高亮的三列（1-indexed 列号）
+HIGHLIGHT_HEADER_COLS = {14, 15, 16}
 
 # UI 表格：精简列，额外带上采样率/位深方便快速核对文件规格。
 # 最后一列 "响度处理" 只在 UI 里出现，用于显示 "处理后 - 处理前" 的响度差；
 # 导出到 Excel 用的是 HEADERS，那边仍然保留原始的 "响度范围(LU)"。
 TABLE_HEADERS = [
-    "文件", "时长", "采样率", "位深", "峰值",
+    "文件", "时长", "采样率", "位深", "真实峰值",
     "瞬时最大", "短期最大", "平均响度", "响度处理",
 ]
 
 
 def build_excel_row(i, row):
-    """把一条分析结果转换成 Excel 明细行（列顺序对应 HEADERS）"""
+    """把一条分析结果转换成 Excel 明细行（列顺序对应 HEADERS）。
+    错误行：除文件名外前面全空，错误信息占最后一列（是否削波位置）作为提示。"""
     if row.get("error"):
-        return [
-            i, row["name"], "", "", "", "",
-            "", "", "", "", "", "", "", "", "", "", row["error"],
-        ]
+        return [i, row["name"]] + [""] * (len(HEADERS) - 3) + [row["error"]]
 
     d = row["data"]
     return [
@@ -434,14 +436,13 @@ def build_excel_row(i, row):
         fmt_db(d["peak_db"]),
         fmt_db(d["rms_l_db"]),
         fmt_db(d["rms_r_db"]) if d["rms_r_db"] is not None else "-",
-        fmt_db(d["lufs_i"]),
         fmt_db(d["lufs_s_max"]),
         fmt_db(d["lufs_m_max"]),
         fmt_db(d["lra"]),
-        fmt_db(d["true_peak_db"]),
         round(d["dc_offset"], 6),
+        fmt_db(d["true_peak_db"]),
+        fmt_db(d["lufs_i"]),
         "是" if d["clip_count"] > 0 else "否",
-        "",
     ]
 
 
@@ -473,7 +474,7 @@ def build_table_row(row):
         fmt_seconds(d["duration"]),
         d["sample_rate"] or "N/A",
         d["bit_depth"] if d["bit_depth"] else "N/A",
-        fmt_db(d["peak_db"], unit="dBFS"),
+        fmt_db(d["true_peak_db"], unit="dBTP"),
         fmt_db(d["lufs_m_max"], unit="LUFS"),
         fmt_db(d["lufs_s_max"], unit="LUFS"),
         fmt_db(d["lufs_i"], unit="LUFS"),
@@ -736,11 +737,17 @@ def process_file(
                 # 增益后不会超 TP，纯线性等比缩放，动态完全保留
                 af = f"volume={gain_db:.6f}dB"
             else:
-                # 会顶爆 TP，串一个 True Peak Limiter 兜底
+                # 会顶爆 TP，串一个 True Peak Limiter 兜底。
+                # 注意：alimiter 是采样峰值限幅器，直接用它会漏掉 inter-sample peak（真实峰值）。
+                # 参照 ITU-R BS.1770-4 的 True Peak 检测算法，把信号先升采样到 192 kHz 再交给 alimiter，
+                # 这样它看到的采样峰值就等价于真峰值；限幅后再降回目标采样率。loudnorm 内部也用 192k。
                 tp_linear = 10 ** (target_tp / 20.0)
+                final_sr = out_sr or src_meta.get("sample_rate") or 48000
                 af = (
                     f"volume={gain_db:.6f}dB,"
-                    f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0"
+                    f"aresample=192000,"
+                    f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0,"
+                    f"aresample={final_sr}"
                 )
 
     # 只需要 loudnorm 被跳过 + 也没有格式转换 = 直接 copy
@@ -786,6 +793,58 @@ def process_file(
     return dst, bool(af), bool(format_config), applied_gain_db
 
 
+def apply_gain_correction(
+    ffmpeg, ffprobe, src, dst, gain_db, target_tp,
+    *, cancel_token=None,
+):
+    """在 src 上叠加 gain_db（dB）后另存到 dst，编码/采样率/声道数跟随 src。
+    正 gain 后可能超 target_tp，末端在 192k 过采样域用 alimiter 兜底；
+    负 gain 只降不升，不会超 TP，跳过 alimiter。
+    用于响度处理后差距超容差时的二次校正：把 dst 视为新的 src，叠加 correction 后覆盖原 dst。"""
+    src = Path(src)
+    dst = Path(dst)
+    src_meta = probe_file(ffprobe, src, cancel_token=cancel_token)
+
+    out_sr = src_meta.get("sample_rate") or 48000
+    out_ch = src_meta.get("channels") or 2
+    codec_args = _pick_output_codec(src.suffix.lower(), src_meta)
+
+    if gain_db > 0.0:
+        tp_linear = 10 ** (target_tp / 20.0)
+        af = (
+            f"volume={gain_db:.6f}dB,"
+            f"aresample=192000,"
+            f"alimiter=limit={tp_linear:.6f}:level=disabled:asc=0,"
+            f"aresample={out_sr}"
+        )
+    else:
+        af = f"volume={gain_db:.6f}dB"
+
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-v", "error", "-i", str(src),
+        "-af", af,
+        "-ar", str(out_sr),
+        "-ac", str(out_ch),
+    ] + codec_args + [str(dst)]
+
+    try:
+        result = _run(cmd, cancel_token=cancel_token)
+    except ProcCancelled:
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        raise
+    if result.returncode != 0 or not dst.exists():
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"校正失败: {result.stderr.decode(errors='ignore')[:300]}")
+
+
 def write_excel(rows, out_path):
     wb = Workbook()
     ws = wb.active
@@ -794,9 +853,16 @@ def write_excel(rows, out_path):
 
     header_fill = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
+    # 真实峰值 / 平均响度 / 是否削波 用橙黄色底 + 深色字，视觉上和普通指标列区分开
+    highlight_fill = PatternFill(start_color="FB9E13", end_color="FB9E13", fill_type="solid")
+    highlight_font = Font(color="1F2430", bold=True)
     for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
+        if cell.column in HIGHLIGHT_HEADER_COLS:
+            cell.fill = highlight_fill
+            cell.font = highlight_font
+        else:
+            cell.fill = header_fill
+            cell.font = header_font
         cell.alignment = Alignment(
             horizontal="center", vertical="center", wrap_text=True,
         )
@@ -824,7 +890,8 @@ def write_excel(rows, out_path):
             for cell in ws[r]:
                 cell.fill = clip_fill
 
-    widths = [6, 28, 10, 10, 8, 10, 11, 14, 14, 13, 15, 15, 11, 12, 10, 9, 30]
+    # 与 HEADERS 一一对应（16 列）
+    widths = [6, 28, 10, 10, 8, 10, 11, 14, 14, 15, 15, 11, 10, 12, 13, 12]
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = w
 

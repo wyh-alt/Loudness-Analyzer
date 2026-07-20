@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
 
 from core import (
     analyze_file, scan_folder, write_excel, find_tool, build_table_row,
-    process_file, CancelToken, ProcCancelled,
+    process_file, apply_gain_correction, CancelToken, ProcCancelled,
     FORMAT_LOSSLESS, FORMAT_LOSSY, TABLE_HEADERS,
 )
 
@@ -674,6 +674,47 @@ class ProcessWorker(QThread):
                 # loudnorm 被容差跳过 + 无格式转换 = 直接 copy，视为"符合要求无需处理"
                 was_skipped = not was_processed
                 new_data = analyze_file(self.ffmpeg, self.ffprobe, dst, cancel_token=self._token)
+
+                # 二次校正：alimiter 削峰会让最终 LUFS 略低于目标；若差距超容差，
+                # 用剩余差值再叠加一次 gain（TP 已经在第一次限住，多数情况下无需再限）。
+                # 这样能把 alimiter 触发场景下的偏差从 ~1.5 dB 收敛到 ~0.3 dB 以内。
+                if (
+                    loudnorm_applied
+                    and self.tolerance_lu is not None
+                    and new_data.get("lufs_i") is not None
+                    and new_data["lufs_i"] != float("-inf")
+                    and abs(new_data["lufs_i"] - self.target_i) > self.tolerance_lu
+                ):
+                    correction_db = self.target_i - new_data["lufs_i"]
+                    dst_tmp = dst.with_suffix(dst.suffix + ".corr")
+                    try:
+                        apply_gain_correction(
+                            self.ffmpeg, self.ffprobe, dst, dst_tmp,
+                            correction_db, self.target_tp,
+                            cancel_token=self._token,
+                        )
+                        # 原子替换 dst
+                        dst.unlink()
+                        dst_tmp.rename(dst)
+                        new_data = analyze_file(
+                            self.ffmpeg, self.ffprobe, dst, cancel_token=self._token,
+                        )
+                        applied_gain_db += correction_db
+                    except ProcCancelled:
+                        if dst_tmp.exists():
+                            try:
+                                dst_tmp.unlink()
+                            except OSError:
+                                pass
+                        raise
+                    except Exception:
+                        # 校正失败不影响主流程，保留第一次的结果
+                        if dst_tmp.exists():
+                            try:
+                                dst_tmp.unlink()
+                            except OSError:
+                                pass
+
                 new_row = {
                     "name": dst.name, "dir": str(dst.parent),
                     "data": new_data,
@@ -784,9 +825,10 @@ class MainWindow(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
-        # Qt 默认会给"当前单元格"画一个虚线焦点框，样式表压不住，直接关掉表格的键盘焦点；
-        # Ctrl+A/Ctrl+C 走 WindowShortcut，不受影响
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # 用 ClickFocus 让点击 table 时焦点落在 table 上 —— 这样按 Ctrl+C 时 focusWidget()
+        # 是 table 本身而不是别处（比如 spinbox 内部的 QLineEdit），才能正确走到复制单元格
+        # 逻辑。虚线焦点框已经在样式表里靠 outline: 0 消掉了
+        self.table.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         # 默认按"整格"滚动，横向拖会一格一跳看着卡；改成按像素滚动就顺滑了
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1063,14 +1105,13 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(bool(self.ffmpeg and self.ffprobe))
 
     def _clear_rows_data(self):
-        """清空当前所有行的数据/错误状态，保留文件名与目录。
-        UI 上除文件名列外全部留空，等 worker 逐首回填。"""
-        for row in self._loaded_rows:
-            row.pop("data", None)
-            row.pop("error", None)
+        """清空 UI 表格中除文件名外的所有显示，等 worker 逐首回填。
+        内存里的 _loaded_rows[i]['data'] 保留不动 —— 这样 process_file 能命中
+        「LUFS 已在容差 → 直接复制」的快速路径，也能复用响度统计过的
+        measured_lufs 避免多跑一次测量，显著加快首次处理速度。"""
         for r, row in enumerate(self._loaded_rows):
             if r < self.table.rowCount():
-                self._fill_row(r, build_table_row(row))
+                self._fill_row(r, [row["name"]] + [""] * (len(TABLE_HEADERS) - 1))
 
     def on_measure(self):
         """响度统计：对当前 loaded_rows 逐首跑 analyze_file"""
@@ -1293,9 +1334,16 @@ class MainWindow(QWidget):
         self.status_label.setText("已取消")
 
     def set_theme(self, dark: bool):
-        self._accent_color = (_DARK if dark else _LIGHT)["accent"]
+        c = _DARK if dark else _LIGHT
+        self._accent_color = c["accent"]
         if hasattr(self, "_selection_delegate"):
             self._selection_delegate.set_color(self._accent_color)
+            # 只把表格自身的 Highlight 改成跟背景一样，从根上消掉原生 highlight 露出的边角；
+            # 全局 app palette 保持默认 —— 否则 QLineEdit / QDoubleSpinBox 里框选文字看不见选中反馈
+            table_palette = self.table.palette()
+            table_palette.setColor(QPalette.ColorRole.Highlight, QColor(c["surface"]))
+            table_palette.setColor(QPalette.ColorRole.HighlightedText, QColor(c["text"]))
+            self.table.setPalette(table_palette)
             self.table.viewport().update()
 
 
@@ -1304,14 +1352,6 @@ def apply_theme(app, window, scheme=None):
     is_dark = scheme == Qt.ColorScheme.Dark
     app.setStyleSheet(build_stylesheet(is_dark))
     window.set_theme(is_dark)
-
-    # 系统强调色（如橙色）会通过 QPalette.Highlight 在原生控件绘制里露出一点边角，
-    # 样式表盖不住；把 Highlight 直接改成跟正常背景/文字一样的颜色，从根上消掉这个残留色块
-    c = _DARK if is_dark else _LIGHT
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(c["surface"]))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(c["text"]))
-    app.setPalette(palette)
 
 
 def _make_splash_pixmap(subtitle_text: str) -> QPixmap:
